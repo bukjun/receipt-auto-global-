@@ -45,6 +45,15 @@ client = OpenAI(
 # 1차 영수증 AI 분석 병렬 처리 수
 FIRST_PASS_MAX_WORKERS = 4
 
+# 1차 AI 전송용 이미지 최적화
+# 원본 증빙 이미지는 그대로 보존하고, AI에 보내는 사본만 축소한다.
+FIRST_PASS_AI_MAX_SIDE = 1800
+FIRST_PASS_AI_JPEG_QUALITY = 88
+
+# 매우 높은 신뢰도 + 핵심값/원문/crop이 정상일 때는
+# complete_visible / needs_review 같은 보조 플래그만으로 재검증하지 않는다.
+HIGH_CONFIDENCE_EVIDENCE_AUTO_APPROVE = 0.97
+
 
 st.set_page_config(
     page_title="영수증 AI 자동정산",
@@ -1772,6 +1781,96 @@ def approve_evidence(
 # 14. AI 분석
 # =========================================================
 
+def prepare_first_pass_ai_image(
+    file_bytes,
+    max_side=FIRST_PASS_AI_MAX_SIDE,
+    quality=FIRST_PASS_AI_JPEG_QUALITY,
+):
+    """
+    1차 AI 분석 전송용 사본만 축소한다.
+
+    - 원본 file_bytes는 절대 변경하지 않는다.
+    - 긴 변이 max_side보다 큰 경우에만 비율 유지 축소한다.
+    - API 전송용 사본은 JPEG로 통일한다.
+    - EXIF 회전을 먼저 반영한다.
+
+    실패 시에는 원본 bytes와 원래 mime type을 그대로 사용할 수 있도록
+    (file_bytes, None)을 반환한다.
+    """
+
+    try:
+        image = Image.open(
+            io.BytesIO(
+                file_bytes
+            )
+        )
+
+        image = ImageOps.exif_transpose(
+            image
+        ).convert(
+            "RGB"
+        )
+
+        width, height = image.size
+        longest = max(
+            width,
+            height,
+        )
+
+        if longest > max_side:
+            scale = (
+                max_side
+                /
+                longest
+            )
+
+            image = image.resize(
+                (
+                    max(
+                        1,
+                        int(
+                            round(
+                                width
+                                *
+                                scale
+                            )
+                        ),
+                    ),
+                    max(
+                        1,
+                        int(
+                            round(
+                                height
+                                *
+                                scale
+                            )
+                        ),
+                    ),
+                ),
+                Image.Resampling.LANCZOS,
+            )
+
+        output = io.BytesIO()
+
+        image.save(
+            output,
+            format="JPEG",
+            quality=quality,
+            optimize=False,
+        )
+
+        return (
+            output.getvalue(),
+            "image/jpeg",
+        )
+
+    except Exception:
+        return (
+            file_bytes,
+            None,
+        )
+
+
 def get_receipt_analysis_cache_key(
     file_bytes,
 ):
@@ -1799,10 +1898,25 @@ def analyze_receipt_image_uncached(
     - 병렬 실행 안전성을 높인다.
     """
 
+    # 원본 증빙은 그대로 두고, AI에 전송하는 사본만 축소한다.
+    ai_file_bytes, optimized_mime_type = (
+        prepare_first_pass_ai_image(
+            file_bytes
+        )
+    )
+
+    ai_mime_type = (
+        optimized_mime_type
+        or
+        mime_type
+        or
+        "image/jpeg"
+    )
+
     encoded = (
         base64
         .b64encode(
-            file_bytes
+            ai_file_bytes
         )
         .decode(
             "utf-8"
@@ -1949,7 +2063,7 @@ receipt_quad
                             "type":
                                 "input_image",
                             "image_url":
-                                f"data:{mime_type};base64,{encoded}",
+                                f"data:{ai_mime_type};base64,{encoded}",
                             "detail":
                                 "high",
                         },
@@ -2638,23 +2752,99 @@ def pil_to_data_url(
 def can_auto_approve_evidence(
     row
 ):
+    """
+    증빙 자동 승인 판단.
 
-    return (
-        safe_float(
+    일반 규칙은 기존 조건을 유지한다.
+
+    다만 신뢰도가 매우 높은 영수증(기본 97% 이상)은
+    상호/날짜/금액, AI 원문 대조, crop 생성이 모두 정상이라면
+    complete_visible 또는 needs_review 같은 보조 판단 하나만으로
+    불필요한 2차 재검증/확인 필요로 보내지 않는다.
+
+    실제 핵심값 누락, 원문 불일치, crop 실패는 계속 차단한다.
+    """
+
+    confidence = safe_float(
+        row.get(
+            "confidence",
+            0,
+        )
+    )
+
+    source_safe = safe_bool(
+        row.get(
+            "ai_source_safe",
+            False,
+        )
+    )
+
+    crop_ok = safe_bool(
+        row.get(
+            "crop_ok",
+            False,
+        )
+    )
+
+    amount_ok = (
+        safe_int(
             row.get(
-                "confidence",
+                "amount",
                 0,
             )
         )
+        >
+        0
+    )
+
+    merchant_ok = bool(
+        str(
+            row.get(
+                "merchant",
+                "",
+            )
+            or
+            ""
+        ).strip()
+    )
+
+    date_ok = bool(
+        str(
+            row.get(
+                "date",
+                "",
+            )
+            or
+            ""
+        ).strip()
+    )
+
+    # 97% 이상처럼 매우 높은 신뢰도라면
+    # 핵심 데이터와 실제 crop이 정상인 경우 보조 플래그 오탐은 무시한다.
+    if (
+        confidence
+        >=
+        HIGH_CONFIDENCE_EVIDENCE_AUTO_APPROVE
+        and
+        source_safe
+        and
+        crop_ok
+        and
+        amount_ok
+        and
+        merchant_ok
+        and
+        date_ok
+    ):
+        return True
+
+    # 그 외에는 기존의 보수적인 자동승인 조건을 그대로 사용한다.
+    return (
+        confidence
         >=
         0.93
         and
-        safe_bool(
-            row.get(
-                "ai_source_safe",
-                False,
-            )
-        )
+        source_safe
         and
         safe_bool(
             row.get(
@@ -2670,21 +2860,9 @@ def can_auto_approve_evidence(
             )
         )
         and
-        safe_bool(
-            row.get(
-                "crop_ok",
-                False,
-            )
-        )
+        crop_ok
         and
-        safe_int(
-            row.get(
-                "amount",
-                0,
-            )
-        )
-        >
-        0
+        amount_ok
     )
 
 
