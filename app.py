@@ -1703,6 +1703,59 @@ def confirm_receipt(
         "evidence_manual_approved",
     ] = True
 
+    # 중요:
+    # 복수 영수증 crop이 자동 증빙검증을 통과하지 못한 상태라면
+    # 사용자는 검증 화면에서 원본 전체 이미지를 보고 확정하게 된다.
+    # 이 경우 최종 PDF/JPG에도 잘린 crop을 다시 쓰지 않고
+    # 사용자가 실제 확인한 원본 전체 이미지를 사용한다.
+    current_evidence_ok = (
+        df.loc[
+            mask,
+            "evidence_ok",
+        ]
+        .apply(
+            safe_bool
+        )
+    )
+
+    current_crop_mode = (
+        df.loc[
+            mask,
+            "crop_mode",
+        ]
+        .astype(
+            str
+        )
+    )
+
+    force_full_mask = (
+        (
+            current_crop_mode
+            !=
+            "full_image"
+        )
+        &
+        (
+            current_evidence_ok
+            ==
+            False
+        )
+    )
+
+    if "force_full_image_export" not in df.columns:
+
+        df[
+            "force_full_image_export"
+        ] = False
+
+    df.loc[
+        mask,
+        "force_full_image_export",
+    ] = (
+        force_full_mask
+        .values
+    )
+
     df.loc[
         mask,
         "needs_review",
@@ -1880,7 +1933,7 @@ def get_receipt_analysis_cache_key(
             file_bytes
         )
         +
-        "_receipt_v11_fullsafe"
+        "_receipt_v12_amountsafe"
     )
 
 
@@ -1992,6 +2045,13 @@ bbox:
 [x1,y1,x2,y2]
 좌표는 0~1000.
 
+amount_bbox:
+최종 결제금액(source_amount_text)이 실제로 인쇄된 영역만 감싸는 사각형.
+SUBTOTAL, VAT, TAX가 아니라 실제 최종 결제금액 위치를 잡는다.
+[x1,y1,x2,y2]
+좌표는 0~1000.
+최종 결제금액 위치를 확신하지 못하면 null.
+
 위치를 확신하지 못하면 억지로 좌표를 만들지 말고 null.
 
 category:
@@ -2033,6 +2093,7 @@ needs_review
 review_question
 complete_visible
 bbox
+amount_bbox
 receipt_quad
 
 반드시 JSON 배열만 출력한다.
@@ -2229,6 +2290,10 @@ def prepare_crop_boxes(df):
                 "bbox"
             )
 
+            amount_bbox = row.get(
+                "amount_bbox"
+            )
+
             quad = row.get(
                 "receipt_quad"
             )
@@ -2249,6 +2314,27 @@ def prepare_crop_boxes(df):
                         y1,
                         x2,
                         y2,
+                    )
+                )
+
+            # 최종 청구금액 영역은 절대 crop 밖으로 나가면 안 된다.
+            # AI가 영수증 전체 bbox를 조금 짧게 잡더라도
+            # amount_bbox를 crop 후보에 포함해 최종금액 영역을 강제로 보존한다.
+            if valid_bbox(
+                amount_bbox
+            ):
+
+                ax1, ay1, ax2, ay2 = map(
+                    float,
+                    amount_bbox,
+                )
+
+                candidates.append(
+                    (
+                        ax1,
+                        ay1,
+                        ax2,
+                        ay2,
                     )
                 )
 
@@ -2392,10 +2478,10 @@ def prepare_crop_boxes(df):
             )
 
             padding_y = max(
-                18,
+                24,
                 box_height
                 *
-                0.08,
+                0.12,
             )
 
             safe_box = [
@@ -2523,6 +2609,22 @@ def crop_receipt(row):
         )
         or ""
     )
+
+    # -----------------------------------------------------
+    # 사람이 검증 화면의 원본 전체 이미지를 직접 확인한 뒤
+    # 확정한 특수 케이스.
+    #
+    # 잘린 crop을 PDF/JPG에 다시 쓰지 않고 원본 전체를 사용한다.
+    # -----------------------------------------------------
+
+    if safe_bool(
+        row.get(
+            "force_full_image_export",
+            False,
+        )
+    ):
+
+        return image.copy()
 
 
     # -----------------------------------------------------
@@ -2661,33 +2763,64 @@ def get_display_receipt_image(
     row
 ):
     """
-    검증 화면 전용 이미지 fallback.
+    검증 화면 전용 이미지.
 
-    1) 정상 crop이 있으면 해당 crop 표시
-    2) crop 실패 시 원본 전체 이미지 표시
-
-    중요:
-    이 함수는 화면 확인용이다.
-    PDF/JPG 등 정산 증빙 export는 기존 crop_receipt() 안전조건을 그대로 사용한다.
+    원칙:
+    - 자동 증빙검증을 통과한 정상 crop만 crop으로 보여준다.
+    - crop이 잘렸거나 최종금액 확인이 실패한 경우에는
+      사용자가 판단할 수 있도록 원본 전체 이미지를 보여준다.
+    - 이 함수는 화면 표시 전용이다.
     """
 
-    image = crop_receipt(
-        row
+    evidence_ok = safe_bool(
+        row.get(
+            "evidence_ok",
+            False,
+        )
     )
 
-    if image is not None:
-        return image
+    crop_mode = str(
+        row.get(
+            "crop_mode",
+            "",
+        )
+        or ""
+    )
 
+    # 단일 영수증은 원래부터 원본 전체이므로 그대로 표시.
+    if (
+        crop_mode
+        ==
+        "full_image"
+    ):
+
+        return crop_receipt(
+            row
+        )
+
+    # 복수 영수증 crop은 자동 증빙 검증을 통과한 경우에만 표시.
+    if evidence_ok:
+
+        image = crop_receipt(
+            row
+        )
+
+        if image is not None:
+
+            return image
+
+    # crop 실패/잘림/최종금액 미확인 등 검증이 필요한 경우:
+    # 원본 전체를 표시해서 사람이 실제 증빙을 보고 판단할 수 있게 한다.
     source_file = str(
         row.get(
             "source_file",
             "",
         )
-        or
-        ""
+        or ""
     )
 
     if not source_file:
+
         return None
 
     return load_source_image(
@@ -2755,14 +2888,15 @@ def can_auto_approve_evidence(
     """
     증빙 자동 승인 판단.
 
-    일반 규칙은 기존 조건을 유지한다.
+    절대 조건:
+    - 사진 1장에 영수증 1장(full_image)은 기존 고신뢰도 자동승인 가능.
+    - 사진 1장에 여러 영수증이 있는 safe_bbox crop은
+      신뢰도가 99%여도 자동승인하지 않는다.
+      반드시 2차 증빙 검증에서 '최종 청구금액이 실제로 보이는지' 확인한다.
 
-    다만 신뢰도가 매우 높은 영수증(기본 97% 이상)은
-    상호/날짜/금액, AI 원문 대조, crop 생성이 모두 정상이라면
-    complete_visible 또는 needs_review 같은 보조 판단 하나만으로
-    불필요한 2차 재검증/확인 필요로 보내지 않는다.
-
-    실제 핵심값 누락, 원문 불일치, crop 실패는 계속 차단한다.
+    이유:
+    데이터 인식 신뢰도가 높아도 crop 좌표가 짧게 잡히면
+    PDF/JPG 증빙에서 최종금액이 사라질 수 있기 때문이다.
     """
 
     confidence = safe_float(
@@ -2819,9 +2953,40 @@ def can_auto_approve_evidence(
         ).strip()
     )
 
-    # 97% 이상처럼 매우 높은 신뢰도라면
-    # 핵심 데이터와 실제 crop이 정상인 경우 보조 플래그 오탐은 무시한다.
+    crop_mode = str(
+        row.get(
+            "crop_mode",
+            "",
+        )
+        or ""
+    )
+
+    source_receipt_count = safe_int(
+        row.get(
+            "source_receipt_count",
+            0,
+        )
+    )
+
+    # 복수 영수증 crop은 무조건 AI 증빙 재검증으로 보낸다.
     if (
+        source_receipt_count
+        >
+        1
+        or
+        crop_mode
+        ==
+        "safe_bbox"
+    ):
+
+        return False
+
+    # 단일 영수증 full_image만 고신뢰도 우회 허용.
+    if (
+        crop_mode
+        ==
+        "full_image"
+        and
         confidence
         >=
         HIGH_CONFIDENCE_EVIDENCE_AUTO_APPROVE
@@ -2836,10 +3001,14 @@ def can_auto_approve_evidence(
         and
         date_ok
     ):
+
         return True
 
-    # 그 외에는 기존의 보수적인 자동승인 조건을 그대로 사용한다.
     return (
+        crop_mode
+        ==
+        "full_image"
+        and
         confidence
         >=
         0.93
@@ -2927,12 +3096,57 @@ def validate_receipt_crop(
             Image.Resampling.BILINEAR,
         )
 
-    prompt = """
+    expected_source_amount = str(
+        row.get(
+            "source_amount_text",
+            "",
+        )
+        or ""
+    ).strip()
+
+    expected_original_amount = row.get(
+        "original_amount",
+        None,
+    )
+
+    expected_currency = str(
+        row.get(
+            "currency",
+            "",
+        )
+        or ""
+    ).strip()
+
+    expected_krw_amount = safe_int(
+        row.get(
+            "amount",
+            0,
+        )
+    )
+
+    prompt = f"""
 회사 경비정산용 영수증 증빙 이미지다.
 
 이 단계에서는 금액, 상호, 날짜, 품목을 수정하거나 생성하지 않는다.
 
 오직 증빙 이미지가 실무적으로 사용할 수 있는지만 판단한다.
+
+[절대 조건 - 최종 청구금액]
+이 crop 안에는 실제 최종 청구/결제금액이 반드시 완전하게 보여야 한다.
+숫자의 일부가 잘렸거나, TOTAL/합계/결제금액 줄이 crop 밖으로 나갔거나,
+SUBTOTAL/VAT/TAX만 보이고 실제 최종금액이 안 보이면 무조건 실패다.
+
+기대 원문 금액:
+{expected_source_amount}
+
+기대 원통화 금액:
+{expected_original_amount} {expected_currency}
+
+정산 원화 금액:
+{expected_krw_amount} KRW
+
+외화 영수증에서는 원화환산금액이 영수증에 직접 인쇄되어 있을 필요는 없다.
+대신 원통화의 실제 최종 결제금액이 완전하게 보여야 한다.
 
 정상으로 인정:
 - 영수증 전체 사진을 그대로 사용
@@ -2950,7 +3164,7 @@ def validate_receipt_crop(
 
 JSON 객체만 출력:
 
-{
+{{
  "primary_receipt_clear": true,
  "materially_truncated": false,
  "another_receipt_materially_visible": false,
@@ -2958,10 +3172,12 @@ JSON 객체만 출력:
  "merchant_readable": true,
  "date_readable": true,
  "amount_readable": true,
+ "final_amount_visible": true,
+ "final_amount_matches_expected": true,
  "usable_as_evidence": true,
  "confidence": 0.95,
  "issue": ""
-}
+}}
 """
 
     try:
@@ -3060,6 +3276,18 @@ JSON 객체만 출력:
         safe_bool(
             result.get(
                 "amount_readable"
+            )
+        )
+        and
+        safe_bool(
+            result.get(
+                "final_amount_visible"
+            )
+        )
+        and
+        safe_bool(
+            result.get(
+                "final_amount_matches_expected"
             )
         )
         and
@@ -3398,6 +3626,18 @@ def make_export_signature(
                 str(
                     row.get(
                         "crop_bbox",
+                        "",
+                    )
+                ),
+                str(
+                    row.get(
+                        "amount_bbox",
+                        "",
+                    )
+                ),
+                str(
+                    row.get(
+                        "force_full_image_export",
                         "",
                     )
                 ),
@@ -4832,8 +5072,10 @@ if (
                 "review_question",
                 "complete_visible",
                 "bbox",
+                "amount_bbox",
                 "receipt_quad",
                 "source_file",
+                "force_full_image_export",
             ]
 
             for column in required:
@@ -4859,6 +5101,16 @@ if (
                                 len(df)
                             )
                         ]
+
+                    elif (
+                        column
+                        ==
+                        "force_full_image_export"
+                    ):
+
+                        df[
+                            column
+                        ] = False
 
                     else:
 
@@ -6129,12 +6381,19 @@ if (
 
                         if (
                             crop_mode
-                            ==
-                            "failed"
+                            !=
+                            "full_image"
+                            and
+                            not safe_bool(
+                                row.get(
+                                    "evidence_ok",
+                                    False,
+                                )
+                            )
                         ):
 
                             st.caption(
-                                "자동 분리에 실패해 검증용으로 원본 이미지를 표시하고 있습니다."
+                                "자동 crop이 최종 증빙 조건을 통과하지 못해 원본 전체 이미지를 표시하고 있습니다. 직접 확정하면 이 원본 전체가 PDF/JPG 증빙에 사용됩니다."
                             )
 
                     else:
