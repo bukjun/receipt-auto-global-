@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import base64
 import json
 import os
@@ -1088,6 +1089,104 @@ def format_usage_date(date_value):
         return f"{parsed.month}/{parsed.day}"
     except Exception:
         return raw
+
+
+def render_usage_copy_button(copy_text):
+    """
+    화면의 날짜 + 병원명만 클립보드로 복사하는 강조 버튼.
+
+    Streamlit 자체에는 임의 문자열을 클립보드로 넣는 전용 버튼이 없으므로
+    사용자 클릭 이벤트 안에서 브라우저 Clipboard API를 사용한다.
+    로컬 localhost / HTTPS 환경에서 동작하며, 실패 시 execCommand fallback을 사용한다.
+    """
+
+    copy_text = str(
+        copy_text
+        or ""
+    )
+
+    if not copy_text.strip():
+        st.info(
+            "복사할 사용내역이 없습니다."
+        )
+        return
+
+    js_text = json.dumps(
+        copy_text,
+        ensure_ascii=False,
+    )
+
+    components.html(
+        f"""
+        <div style="padding:8px 0 4px 0;">
+            <button
+                id="usage-copy-button"
+                style="
+                    width:100%;
+                    min-height:54px;
+                    border:none;
+                    border-radius:14px;
+                    background:#147CB5;
+                    color:white;
+                    font-size:17px;
+                    font-weight:750;
+                    cursor:pointer;
+                    box-shadow:0 6px 18px rgba(20,124,181,0.18);
+                "
+            >
+                📋 날짜 · 병원명 복사
+            </button>
+            <div
+                id="usage-copy-status"
+                style="
+                    text-align:center;
+                    margin-top:8px;
+                    color:#6E6E73;
+                    font-size:12px;
+                "
+            >
+                지출결의서에 바로 붙여넣을 수 있습니다.
+            </div>
+        </div>
+
+        <script>
+            const copyText = {js_text};
+            const button = document.getElementById('usage-copy-button');
+            const status = document.getElementById('usage-copy-status');
+
+            async function copyUsageText() {{
+                try {{
+                    if (navigator.clipboard && window.isSecureContext) {{
+                        await navigator.clipboard.writeText(copyText);
+                    }} else {{
+                        const textarea = document.createElement('textarea');
+                        textarea.value = copyText;
+                        textarea.style.position = 'fixed';
+                        textarea.style.left = '-9999px';
+                        document.body.appendChild(textarea);
+                        textarea.focus();
+                        textarea.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(textarea);
+                    }}
+
+                    button.innerText = '✅ 복사 완료';
+                    status.innerText = '날짜와 병원명만 클립보드에 복사했습니다.';
+
+                    setTimeout(() => {{
+                        button.innerText = '📋 날짜 · 병원명 복사';
+                        status.innerText = '지출결의서에 바로 붙여넣을 수 있습니다.';
+                    }}, 1800);
+                }} catch (error) {{
+                    status.innerText = '복사에 실패했습니다. 아래 복사용 텍스트를 직접 복사해주세요.';
+                }}
+            }}
+
+            button.addEventListener('click', copyUsageText);
+        </script>
+        """,
+        height=92,
+    )
 
 
 def get_pdf_korean_font(size, bold=False):
@@ -3800,7 +3899,7 @@ def get_receipt_analysis_cache_key(
             file_bytes
         )
         +
-        "_receipt_v21_daily_hospital_usage"
+        "_receipt_v22_usage_copy_delete"
     )
 
 
@@ -6584,6 +6683,7 @@ def create_excel(
         "hospital",
         "source_address",
         "hospital_lookup_method",
+        "usage_excluded",
         "category",
         "settlement_group",
         "amount",
@@ -6648,6 +6748,7 @@ def create_excel(
         "병원",
         "영수증원문_주소",
         "병원매칭방식",
+        "사용내역제외",
         "계정과목",
         "정산구분",
         "금액",
@@ -7283,6 +7384,7 @@ if (
                 "source_address",
                 "hospital",
                 "hospital_lookup_method",
+                "usage_excluded",
                 "merchant_rule_applied",
                 "exchange_rate",
                 "exchange_rate_date",
@@ -7346,6 +7448,16 @@ if (
                         df[
                             column
                         ] = 0
+
+                    elif (
+                        column
+                        ==
+                        "usage_excluded"
+                    ):
+
+                        df[
+                            column
+                        ] = False
 
                     else:
 
@@ -9229,7 +9341,8 @@ if (
             (
                 "어떤 날 어떤 병원을 방문했는지만 날짜별로 정리합니다. "
                 "같은 날 같은 병원의 여러 영수증은 한 줄로 합칩니다. "
-                "병원을 확인하지 못한 날짜는 직접 입력할 수 있습니다."
+                "병원이 아니거나 불필요한 항목은 삭제 체크 후 저장하면 "
+                "사용내역에서만 제외됩니다."
             ),
         )
 
@@ -9239,7 +9352,30 @@ if (
             )
         )
 
-        usage_source = usage_source.reset_index(
+        if "usage_excluded" not in usage_source.columns:
+            usage_source[
+                "usage_excluded"
+            ] = False
+
+        usage_source[
+            "usage_excluded"
+        ] = usage_source[
+            "usage_excluded"
+        ].apply(
+            safe_bool
+        )
+
+        # 사용내역에서 제외된 영수증은 정산/PDF/합계에는 그대로 남고,
+        # 화면의 병원 방문 목록과 복사 내용에서만 빠진다.
+        visible_usage_source = usage_source[
+            usage_source[
+                "usage_excluded"
+            ]
+            !=
+            True
+        ].copy()
+
+        visible_usage_source = visible_usage_source.reset_index(
             drop=True
         )
 
@@ -9248,12 +9384,11 @@ if (
         # -------------------------------------------------
         # 같은 날짜 + 같은 병원은 한 줄로 합치고,
         # 같은 날짜에 서로 다른 병원이 있으면 병원별로 각각 표시한다.
-        # 병원 확인 필요도 날짜별 한 줄만 유지한다.
         # -------------------------------------------------
 
         usage_rows = []
 
-        for usage_date, date_group in usage_source.groupby(
+        for usage_date, date_group in visible_usage_source.groupby(
             "date",
             dropna=False,
             sort=False,
@@ -9276,8 +9411,8 @@ if (
                         hospital_name
                     )
 
-            # 확정된 병원이 하나라도 있으면 동일 날짜의
-            # '병원 확인 필요'는 화면에서 제거한다.
+            # 확정된 병원이 하나라도 있으면 같은 날짜의
+            # '병원 확인 필요'는 화면에서 중복 노출하지 않는다.
             confirmed_hospitals = [
                 hospital
                 for hospital in hospitals
@@ -9296,7 +9431,6 @@ if (
                     "병원 확인 필요"
                 ]
 
-            # 해당 날짜에서 주소 후보 수집
             addresses = []
 
             if "source_address" in date_group.columns:
@@ -9324,7 +9458,6 @@ if (
 
             for hospital_name in hospitals:
 
-                # 이 날짜의 어떤 receipt가 해당 병원에 연결되는지 보관.
                 receipt_ids = []
 
                 for _, row in date_group.iterrows():
@@ -9348,8 +9481,6 @@ if (
                             )
                         )
 
-                # 병원 확인 필요인 경우에는 날짜 전체 receipt에 적용 가능하도록
-                # 해당 날짜 모든 receipt_id를 묶는다.
                 if (
                     hospital_name
                     ==
@@ -9390,6 +9521,9 @@ if (
                             " / ".join(
                                 addresses[:2]
                             ),
+
+                        "삭제":
+                            False,
                     }
                 )
 
@@ -9397,151 +9531,266 @@ if (
             usage_rows
         )
 
-        with st.form(
-            "usage_history_editor_form",
-            clear_on_submit=False,
-        ):
+        if usage_editor_df.empty:
 
-            edited_usage = st.data_editor(
-                usage_editor_df,
-                hide_index=True,
-                use_container_width=True,
-                column_order=[
-                    "날짜",
-                    "병원",
-                    "주소 참고",
-                ],
-                disabled=[
-                    "날짜",
-                    "주소 참고",
-                ],
-                column_config={
-                    "병원":
-                        st.column_config.TextColumn(
+            st.info(
+                "표시할 사용내역이 없습니다."
+            )
+
+        else:
+
+            with st.form(
+                "usage_history_editor_form",
+                clear_on_submit=False,
+            ):
+
+                edited_usage = st.data_editor(
+                    usage_editor_df,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_order=[
+                        "날짜",
+                        "병원",
+                        "주소 참고",
+                        "삭제",
+                    ],
+                    disabled=[
+                        "날짜",
+                        "주소 참고",
+                    ],
+                    column_config={
+                        "병원":
+                            st.column_config.TextColumn(
+                                "병원",
+                                help=(
+                                    "병원 확인 필요로 표시된 날짜는 "
+                                    "직접 병원명을 입력하세요."
+                                ),
+                                width="medium",
+                            ),
+
+                        "주소 참고":
+                            st.column_config.TextColumn(
+                                "주소 참고",
+                                help=(
+                                    "병원명이 불명확할 때 영수증에서 읽은 주소를 참고하세요."
+                                ),
+                                width="large",
+                            ),
+
+                        "삭제":
+                            st.column_config.CheckboxColumn(
+                                "🗑️ 삭제",
+                                help=(
+                                    "체크 후 저장하면 영수증 자체는 삭제하지 않고 "
+                                    "사용내역 목록에서만 제외합니다."
+                                ),
+                                default=False,
+                                width="small",
+                            ),
+                    },
+                    key="usage_history_editor",
+                )
+
+                save_usage = st.form_submit_button(
+                    "사용내역 저장",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if save_usage:
+
+                updated = (
+                    st.session_state
+                    .receipt_df
+                    .copy()
+                )
+
+                if "usage_excluded" not in updated.columns:
+                    updated[
+                        "usage_excluded"
+                    ] = False
+
+                hospital_changed = 0
+                excluded_count = 0
+
+                for row_index, usage_row in edited_usage.iterrows():
+
+                    original_row = usage_editor_df.iloc[
+                        row_index
+                    ]
+
+                    receipt_ids = [
+                        value
+                        for value in str(
+                            original_row.get(
+                                "_receipt_ids",
+                                "",
+                            )
+                            or ""
+                        ).split(
+                            "|||"
+                        )
+                        if value
+                    ]
+
+                    if not receipt_ids:
+                        continue
+
+                    mask = (
+                        updated[
+                            "receipt_id"
+                        ].astype(str)
+                        .isin(
+                            receipt_ids
+                        )
+                    )
+
+                    if not mask.any():
+                        continue
+
+                    delete_usage = safe_bool(
+                        usage_row.get(
+                            "삭제",
+                            False,
+                        )
+                    )
+
+                    if delete_usage:
+
+                        updated.loc[
+                            mask,
+                            "usage_excluded",
+                        ] = True
+
+                        excluded_count += 1
+                        continue
+
+                    hospital_value = str(
+                        usage_row.get(
                             "병원",
-                            help=(
-                                "병원 확인 필요로 표시된 날짜는 "
-                                "직접 병원명을 입력하세요."
-                            ),
-                            width="medium",
-                        ),
-
-                    "주소 참고":
-                        st.column_config.TextColumn(
-                            "주소 참고",
-                            help=(
-                                "병원명이 불명확할 때 영수증에서 읽은 주소를 참고하세요."
-                            ),
-                            width="large",
-                        ),
-                },
-                key="usage_history_editor",
-            )
-
-            save_usage = st.form_submit_button(
-                "사용내역 저장",
-                type="primary",
-                use_container_width=True,
-            )
-
-        if save_usage:
-
-            updated = (
-                st.session_state
-                .receipt_df
-                .copy()
-            )
-
-            changed = 0
-
-            for row_index, usage_row in edited_usage.iterrows():
-
-                hospital_value = str(
-                    usage_row.get(
-                        "병원",
-                        "",
-                    )
-                    or ""
-                ).strip()
-
-                if not hospital_value:
-                    hospital_value = "병원 확인 필요"
-
-                original_row = usage_editor_df.iloc[
-                    row_index
-                ]
-
-                original_hospital = str(
-                    original_row.get(
-                        "병원",
-                        "",
-                    )
-                    or ""
-                ).strip()
-
-                if hospital_value == original_hospital:
-                    continue
-
-                receipt_ids = [
-                    value
-                    for value in str(
-                        original_row.get(
-                            "_receipt_ids",
                             "",
                         )
                         or ""
-                    ).split(
-                        "|||"
+                    ).strip()
+
+                    if not hospital_value:
+                        hospital_value = "병원 확인 필요"
+
+                    original_hospital = str(
+                        original_row.get(
+                            "병원",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+
+                    if hospital_value != original_hospital:
+
+                        updated.loc[
+                            mask,
+                            "hospital",
+                        ] = hospital_value
+
+                        updated.loc[
+                            mask,
+                            "hospital_lookup_method",
+                        ] = "사용자 입력"
+
+                        hospital_changed += 1
+
+                st.session_state.receipt_df = updated
+
+                # 병원명 변경은 Excel 등 생성 파일의 메타데이터에 영향을 주므로
+                # 기존 export cache를 무효화한다.
+                # 단순 사용내역 삭제는 정산/PDF/JPG에는 영향을 주지 않아
+                # 불필요한 재생성을 하지 않는다.
+                if hospital_changed:
+                    invalidate_generated_files()
+
+                message_parts = []
+
+                if hospital_changed:
+                    message_parts.append(
+                        f"병원명 {hospital_changed}건 수정"
                     )
-                    if value
-                ]
 
-                if not receipt_ids:
-                    continue
+                if excluded_count:
+                    message_parts.append(
+                        f"사용내역 {excluded_count}건 제외"
+                    )
 
-                mask = (
-                    updated[
-                        "receipt_id"
-                    ].astype(str)
-                    .isin(
-                        receipt_ids
+                set_flash(
+                    (
+                        " · ".join(
+                            message_parts
+                        )
+                        if message_parts
+                        else
+                        "사용내역을 확인했습니다."
                     )
                 )
 
-                if not mask.any():
+                st.rerun()
+
+            # -------------------------------------------------
+            # 날짜 + 병원명만 복사
+            # -------------------------------------------------
+            # 주소/상호/금액/계정과목은 복사하지 않는다.
+            # -------------------------------------------------
+
+            copy_lines = []
+
+            for _, copy_row in usage_editor_df.iterrows():
+
+                if safe_bool(
+                    copy_row.get(
+                        "삭제",
+                        False,
+                    )
+                ):
                     continue
 
-                updated.loc[
-                    mask,
-                    "hospital",
-                ] = hospital_value
+                usage_date_text = str(
+                    copy_row.get(
+                        "날짜",
+                        "",
+                    )
+                    or ""
+                ).strip()
 
-                updated.loc[
-                    mask,
-                    "hospital_lookup_method",
-                ] = "사용자 입력"
+                hospital_text = str(
+                    copy_row.get(
+                        "병원",
+                        "",
+                    )
+                    or ""
+                ).strip()
 
-                changed += 1
+                if not hospital_text:
+                    hospital_text = "병원 확인 필요"
 
-            st.session_state.receipt_df = updated
+                if usage_date_text:
+                    copy_lines.append(
+                        f"{usage_date_text}\t{hospital_text}"
+                    )
 
-            invalidate_generated_files()
-
-            set_flash(
-                (
-                    f"날짜별 사용내역을 저장했습니다. {changed}건 수정"
-                    if changed
-                    else
-                    "사용내역을 확인했습니다."
-                )
+            copy_text = "\n".join(
+                copy_lines
             )
 
-            st.rerun()
+            st.caption(
+                "복사되는 내용은 날짜와 병원명뿐입니다."
+            )
+
+            render_usage_copy_button(
+                copy_text
+            )
 
         # 병원 확인이 안 된 날짜만 주소 검색 재시도.
         unresolved_dates = []
 
-        for usage_date, date_group in usage_source.groupby(
+        for usage_date, date_group in visible_usage_source.groupby(
             "date",
             dropna=False,
             sort=False,
@@ -9611,7 +9860,6 @@ if (
                 )
 
                 st.rerun()
-
 
 
     # =====================================================
