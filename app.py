@@ -21,7 +21,7 @@ import numpy as np
 
 from openai import OpenAI
 from dotenv import load_dotenv
-from PIL import Image, ImageOps, ImageDraw
+from PIL import Image, ImageOps, ImageDraw, ImageFont, ImageFilter
 
 try:
     import fitz  # PyMuPDF
@@ -61,6 +61,11 @@ ROTATED_REANALYSIS_JPEG_QUALITY = 90
 # 매우 높은 신뢰도 + 핵심값/원문/crop이 정상일 때는
 # complete_visible / needs_review 같은 보조 플래그만으로 재검증하지 않는다.
 HIGH_CONFIDENCE_EVIDENCE_AUTO_APPROVE = 0.97
+
+# 상호/원문 상호를 못 읽은 정도의 비핵심 오류는
+# 신뢰도 90% 이상이면 확인 필요 사유로 사용하지 않는다.
+# 단, 금액 불일치 / 외화 환율 문제 / 증빙 잘림 / 중복은 그대로 엄격하게 유지한다.
+HIGH_CONFIDENCE_SOFT_SOURCE_AUTO_APPROVE = 0.90
 
 
 st.set_page_config(
@@ -116,6 +121,1007 @@ def get_settlement_group(category):
         return "식대·음료"
 
     return "일반 항목"
+
+
+
+# =========================================================
+# 회사 사용내역용 병원명 자동 매칭
+# =========================================================
+
+HOSPITAL_ALIASES = {
+    "서울대병원": [
+        "서울대학교병원",
+        "서울대병원",
+        "대한외래",
+        "서울대학교병원 대한외래",
+        "서울대병원 대한외래",
+    ],
+    "신촌세브란스": [
+        "신촌세브란스",
+        "세브란스병원",
+        "연세세브란스",
+        "연세대학교 세브란스병원",
+        "연세대학교의료원",
+        "연세의료원",
+        "연세암병원",
+    ],
+    "강남세브란스": [
+        "강남세브란스",
+        "강남세브란스병원",
+    ],
+    "서울아산병원": [
+        "서울아산병원",
+        "아산병원",
+    ],
+    "삼성서울병원": [
+        "삼성서울병원",
+    ],
+    "부천세종병원": [
+        "부천세종병원",
+        "세종병원 부천",
+    ],
+    "서울성모병원": [
+        "서울성모병원",
+        "가톨릭대학교 서울성모병원",
+    ],
+    "이대서울병원": [
+        "이대서울병원",
+        "이화여자대학교 서울병원",
+    ],
+    "고대안암병원": [
+        "고대안암병원",
+        "고려대학교 안암병원",
+        "고려대 안암병원",
+    ],
+}
+
+
+# =========================================================
+# 반복 거래처 / 시설 규칙 DB
+# =========================================================
+#
+# 목적:
+# - AI가 상호명을 조금 다르게 읽어도 회사에서 자주 쓰는 업체를
+#   안정적으로 계정과목 / 병원으로 보정한다.
+# - 모델 재학습 없이 실사용 정확도를 높인다.
+#
+# 규칙:
+# - aliases: 영수증에 나타날 수 있는 별칭
+# - category: 강제로 적용할 계정과목
+# - hospital: 병원/사용처가 확실한 경우만 지정
+# - canonical_merchant: 대표 상호명. 필요 없으면 생략 가능
+#
+# 이 DB는 코드 안에 있어 별도 서버/DB 설치가 필요 없다.
+# 실제 사용하면서 alias만 계속 추가하면 된다.
+# =========================================================
+
+MERCHANT_RULE_DB = [
+    # -----------------------------------------------------
+    # 카페 / 음료
+    # -----------------------------------------------------
+    {
+        "name": "폴바셋",
+        "aliases": [
+            "폴바셋",
+            "폴 바셋",
+            "풀바셋",
+            "풀 바셋",
+            "paul bassett",
+            "paulbassett",
+        ],
+        "category": "카페/음료",
+    },
+    {
+        "name": "던킨",
+        "aliases": [
+            "던킨",
+            "던킨도너츠",
+            "dunkin",
+            "dunkin'",
+            "dunkin donuts",
+        ],
+        "category": "카페/음료",
+    },
+    {
+        "name": "배스킨라빈스",
+        "aliases": [
+            "배스킨라빈스",
+            "베스킨라빈스",
+            "baskin robbins",
+            "baskinrobbins",
+            "baskin br robbins",
+        ],
+        "category": "카페/음료",
+    },
+    {
+        "name": "스타벅스",
+        "aliases": [
+            "스타벅스",
+            "starbucks",
+        ],
+        "category": "카페/음료",
+    },
+    {
+        "name": "투썸플레이스",
+        "aliases": [
+            "투썸",
+            "투썸플레이스",
+            "a twosome place",
+            "twosome place",
+        ],
+        "category": "카페/음료",
+    },
+    {
+        "name": "이디야",
+        "aliases": [
+            "이디야",
+            "ediya",
+        ],
+        "category": "카페/음료",
+    },
+    {
+        "name": "메가MGC커피",
+        "aliases": [
+            "메가커피",
+            "메가mgc커피",
+            "mega mgc coffee",
+            "mgc coffee",
+        ],
+        "category": "카페/음료",
+    },
+    {
+        "name": "컴포즈커피",
+        "aliases": [
+            "컴포즈",
+            "컴포즈커피",
+            "compose coffee",
+        ],
+        "category": "카페/음료",
+    },
+
+    # -----------------------------------------------------
+    # 주유
+    # -----------------------------------------------------
+    {
+        "name": "GS칼텍스",
+        "aliases": [
+            "gs칼텍스",
+            "gs 칼텍스",
+            "gs caltex",
+            "gs칼택스",
+        ],
+        "category": "유류비",
+    },
+    {
+        "name": "SK에너지",
+        "aliases": [
+            "sk에너지",
+            "sk energy",
+            "sk주유소",
+            "sk 주유소",
+        ],
+        "category": "유류비",
+    },
+    {
+        "name": "S-OIL",
+        "aliases": [
+            "s-oil",
+            "soil",
+            "에쓰오일",
+            "에스오일",
+        ],
+        "category": "유류비",
+    },
+    {
+        "name": "HD현대오일뱅크",
+        "aliases": [
+            "현대오일뱅크",
+            "hd현대오일뱅크",
+            "hyundai oilbank",
+            "oilbank",
+        ],
+        "category": "유류비",
+    },
+
+    # -----------------------------------------------------
+    # 통행료
+    # -----------------------------------------------------
+    {
+        "name": "하이패스",
+        "aliases": [
+            "하이패스",
+            "hi-pass",
+            "hipass",
+            "한국도로공사",
+            "고속도로 통행료",
+            "toll fee",
+            "tollgate",
+            "toll gate",
+        ],
+        "category": "통행료",
+    },
+
+    # -----------------------------------------------------
+    # 병원 주차 / 시설
+    # -----------------------------------------------------
+    {
+        "name": "대한외래 주차",
+        "aliases": [
+            "대한외래",
+            "서울대학교병원 대한외래",
+            "서울대병원 대한외래",
+        ],
+        "category": "주차비",
+        "hospital": "서울대병원",
+    },
+    {
+        "name": "부천세종병원 주차",
+        "aliases": [
+            "부천세종병원 주차장",
+            "주차장명칭부천세종병원",
+            "부천세종병원 매출전표",
+        ],
+        "category": "주차비",
+        "hospital": "부천세종병원",
+    },
+
+    # -----------------------------------------------------
+    # 병원 내부 매장 / 병원명 보조
+    # -----------------------------------------------------
+    {
+        "name": "서울대병원 원내매장",
+        "aliases": [
+            "서울대학교병원점",
+            "서울대학병원점",
+            "서울대병원점",
+            "서울 종로구 대학로 101",
+            "종로구 대학로 101",
+        ],
+        "hospital": "서울대병원",
+    },
+    {
+        "name": "신촌세브란스 원내매장",
+        "aliases": [
+            "연세암병원점",
+            "연세 세브란스병원점",
+            "세브란스병원점",
+            "연세세브란스병원점",
+            "연세암병원",
+        ],
+        "hospital": "신촌세브란스",
+    },
+]
+
+
+def normalize_rule_text(value):
+    """
+    거래처 규칙 매칭용 텍스트 정규화.
+    한글/영문/숫자는 유지하고 공백/기호 차이를 줄인다.
+    """
+
+    raw = str(
+        value
+        or ""
+    ).lower()
+
+    return re.sub(
+        r"[^0-9a-z가-힣]+",
+        "",
+        raw,
+    )
+
+
+def build_receipt_rule_text(row_or_result):
+    """
+    규칙 DB 검색용으로 상호/원문/품목/병원후보를 합친다.
+    """
+
+    if isinstance(
+        row_or_result,
+        dict,
+    ):
+        row = row_or_result
+    else:
+        row = row_or_result.to_dict()
+
+    items = row.get(
+        "items_text",
+        [],
+    )
+
+    if isinstance(
+        items,
+        list,
+    ):
+        items_text = " ".join(
+            str(item)
+            for item in items
+        )
+    else:
+        items_text = str(
+            items
+            or ""
+        )
+
+    return " ".join(
+        [
+            str(
+                row.get(
+                    "merchant",
+                    "",
+                )
+                or ""
+            ),
+            str(
+                row.get(
+                    "source_merchant_text",
+                    "",
+                )
+                or ""
+            ),
+            str(
+                row.get(
+                    "hospital_candidate",
+                    "",
+                )
+                or ""
+            ),
+            items_text,
+        ]
+    )
+
+
+def find_merchant_rule(
+    row_or_result
+):
+    """
+    가장 긴 alias부터 검색해 너무 짧은 키워드의 오탐을 줄인다.
+    """
+
+    combined = normalize_rule_text(
+        build_receipt_rule_text(
+            row_or_result
+        )
+    )
+
+    if not combined:
+        return None
+
+    candidates = []
+
+    for rule in MERCHANT_RULE_DB:
+
+        for alias in rule.get(
+            "aliases",
+            [],
+        ):
+
+            alias_normalized = normalize_rule_text(
+                alias
+            )
+
+            if not alias_normalized:
+                continue
+
+            candidates.append(
+                (
+                    len(
+                        alias_normalized
+                    ),
+                    alias_normalized,
+                    rule,
+                )
+            )
+
+    candidates.sort(
+        key=lambda item: item[
+            0
+        ],
+        reverse=True,
+    )
+
+    for _, alias_normalized, rule in candidates:
+
+        if (
+            alias_normalized
+            in
+            combined
+        ):
+
+            return rule
+
+    return None
+
+
+def apply_merchant_rule_db(
+    result
+):
+    """
+    반복 거래처 DB를 분석 결과에 적용한다.
+
+    중요:
+    - 금액/날짜는 절대 DB로 생성하지 않는다.
+    - 계정과목과 병원/사용처만 보조한다.
+    - 사용자가 나중에 직접 수정한 값은 이 함수가 다시 덮지 않는다.
+    """
+
+    row = dict(
+        result
+        or {}
+    )
+
+    rule = find_merchant_rule(
+        row
+    )
+
+    row[
+        "merchant_rule_applied"
+    ] = ""
+
+    if not rule:
+        return row
+
+    row[
+        "merchant_rule_applied"
+    ] = str(
+        rule.get(
+            "name",
+            "",
+        )
+        or ""
+    )
+
+    category = str(
+        rule.get(
+            "category",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if category in CATEGORIES:
+
+        row[
+            "category"
+        ] = category
+
+    hospital = str(
+        rule.get(
+            "hospital",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if hospital:
+
+        row[
+            "hospital_candidate"
+        ] = hospital
+
+    return row
+
+
+
+
+def normalize_hospital_text(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return re.sub(
+        r"[\s\(\)\[\]\{\}\-_·,.]",
+        "",
+        raw,
+    ).lower()
+
+
+def match_hospital_alias(text_value):
+    normalized = normalize_hospital_text(text_value)
+    if not normalized:
+        return ""
+
+    candidates = []
+    for hospital_name, aliases in HOSPITAL_ALIASES.items():
+        for alias in aliases:
+            candidates.append(
+                (
+                    len(normalize_hospital_text(alias)),
+                    hospital_name,
+                    alias,
+                )
+            )
+
+    candidates.sort(reverse=True)
+
+    for _, hospital_name, alias in candidates:
+        alias_normalized = normalize_hospital_text(alias)
+        if alias_normalized and alias_normalized in normalized:
+            return hospital_name
+
+    return ""
+
+
+def resolve_hospital_name(row_or_result):
+    if isinstance(row_or_result, dict):
+        row = row_or_result
+    else:
+        row = row_or_result.to_dict()
+
+    hospital = str(row.get("hospital", "") or "").strip()
+    if hospital and hospital != "병원 확인 필요":
+        return match_hospital_alias(hospital) or hospital
+
+    candidate = str(
+        row.get(
+            "hospital_candidate",
+            "",
+        )
+        or ""
+    ).strip()
+
+    if candidate:
+        matched = match_hospital_alias(candidate)
+        if matched:
+            return matched
+
+        candidate_lower = candidate.lower()
+        if (
+            "병원" in candidate
+            or "hospital" in candidate_lower
+            or "medical center" in candidate_lower
+        ):
+            return candidate
+
+    items = row.get("items_text", [])
+    if isinstance(items, list):
+        items_text = " ".join(str(item) for item in items)
+    else:
+        items_text = str(items or "")
+
+    combined = " ".join(
+        [
+            str(row.get("merchant", "") or ""),
+            str(row.get("source_merchant_text", "") or ""),
+            str(row.get("source_date_text", "") or ""),
+            str(row.get("hospital_candidate", "") or ""),
+            items_text,
+        ]
+    )
+
+    matched = match_hospital_alias(combined)
+    if matched:
+        return matched
+
+    return "병원 확인 필요"
+
+
+def apply_hospital_names(df):
+    result = df.copy()
+
+    if "hospital" not in result.columns:
+        result["hospital"] = ""
+
+    if "hospital_candidate" not in result.columns:
+        result["hospital_candidate"] = ""
+
+    result["hospital"] = result.apply(
+        resolve_hospital_name,
+        axis=1,
+    )
+
+    return result
+
+
+
+def normalize_address_key(value):
+    """
+    병원 주소 검색 cache key용 정규화.
+    """
+    return re.sub(
+        r"\s+",
+        " ",
+        str(
+            value
+            or ""
+        ).strip().lower(),
+    )
+
+
+def lookup_hospital_by_address_uncached(
+    source_address,
+    merchant="",
+):
+    """
+    영수증 주소로 관련 병원을 웹 검색한다.
+
+    사용 조건:
+    - 기존 병원 alias/DB로 병원명을 못 찾은 경우에만 호출
+    - 주소가 실제 영수증에서 읽힌 경우에만 호출
+    - 결과를 확신할 수 없으면 병원 확인 필요로 남긴다
+
+    이 함수는 worker에서 호출 가능하도록 session_state를 사용하지 않는다.
+    """
+
+    source_address = str(
+        source_address
+        or ""
+    ).strip()
+
+    merchant = str(
+        merchant
+        or ""
+    ).strip()
+
+    if not source_address:
+        return {
+            "hospital": "",
+            "confidence": 0.0,
+            "reason": "주소 없음",
+        }
+
+    lookup_client = OpenAI(
+        api_key=API_KEY,
+        timeout=35.0,
+        max_retries=1,
+    )
+
+    prompt = f"""
+회사 경비정산 영수증의 병원 사용처를 찾는 작업이다.
+
+영수증에서 직접 읽은 주소:
+{source_address}
+
+영수증 상호/시설명:
+{merchant}
+
+웹 검색을 사용해서 이 주소 또는 동일 건물/시설이
+어느 병원과 직접 관련된 장소인지 확인하라.
+
+판정 원칙:
+- 주소가 병원 건물, 병원 주차장, 병원 내 매장, 병원 부속 시설이면 대표 병원명을 반환.
+- 가까이에 병원이 있다는 이유만으로 아무 병원이나 선택하지 않는다.
+- 해당 주소/시설과 병원의 직접적인 연관성이 확인되어야 한다.
+- 예: 대한외래 -> 서울대병원
+- 확인이 어렵거나 여러 병원이 비슷하게 걸리면 hospital은 빈 문자열.
+- 병원명은 사용내역에 보기 좋은 대표명으로 간단히 정리.
+  예: 서울대학교병원 -> 서울대병원
+
+JSON 객체만 반환:
+{{
+  "hospital": "",
+  "confidence": 0.0,
+  "reason": ""
+}}
+"""
+
+    try:
+        response = lookup_client.responses.create(
+            model="gpt-5.6-luna",
+            store=False,
+            tools=[
+                {
+                    "type": "web_search",
+                    "search_context_size": "low",
+                }
+            ],
+            input=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+        )
+
+        parsed = json.loads(
+            clean_json_object(
+                response.output_text
+            )
+        )
+
+        hospital = str(
+            parsed.get(
+                "hospital",
+                "",
+            )
+            or ""
+        ).strip()
+
+        confidence = safe_float(
+            parsed.get(
+                "confidence",
+                0,
+            )
+        )
+
+        reason = str(
+            parsed.get(
+                "reason",
+                "",
+            )
+            or ""
+        ).strip()
+
+        # 과한 추론 방지.
+        if (
+            not hospital
+            or
+            confidence < 0.75
+        ):
+            return {
+                "hospital": "",
+                "confidence": confidence,
+                "reason": reason or "병원 연관성을 충분히 확인하지 못했습니다.",
+            }
+
+        return {
+            "hospital":
+                match_hospital_alias(
+                    hospital
+                )
+                or
+                hospital,
+            "confidence": confidence,
+            "reason": reason,
+        }
+
+    except Exception as exc:
+        return {
+            "hospital": "",
+            "confidence": 0.0,
+            "reason": f"주소 검색 실패: {exc}",
+        }
+
+
+def enrich_unknown_hospitals_by_address(
+    df,
+    max_workers=3,
+):
+    """
+    병원명이 아직 확인되지 않은 행만 주소 기반 웹 검색으로 보완한다.
+
+    비용/속도 보호:
+    - 이미 병원이 있는 행은 검색하지 않음
+    - source_address가 없는 행은 검색하지 않음
+    - 동일 주소는 session cache 재사용
+    - 최대 3개만 병렬 검색
+    """
+
+    result = df.copy()
+
+    if "source_address" not in result.columns:
+        result[
+            "source_address"
+        ] = ""
+
+    if "hospital_lookup_method" not in result.columns:
+        result[
+            "hospital_lookup_method"
+        ] = ""
+
+    cache = st.session_state.hospital_lookup_cache
+
+    jobs = []
+    pending_by_key = {}
+
+    for idx, row in result.iterrows():
+
+        current_hospital = resolve_hospital_name(
+            row
+        )
+
+        if (
+            current_hospital
+            and
+            current_hospital
+            !=
+            "병원 확인 필요"
+        ):
+            result.at[
+                idx,
+                "hospital",
+            ] = current_hospital
+
+            if not str(
+                result.at[
+                    idx,
+                    "hospital_lookup_method",
+                ]
+                or ""
+            ).strip():
+                result.at[
+                    idx,
+                    "hospital_lookup_method",
+                ] = "DB/영수증"
+            continue
+
+        address = str(
+            row.get(
+                "source_address",
+                "",
+            )
+            or ""
+        ).strip()
+
+        if not address:
+            continue
+
+        key = normalize_address_key(
+            address
+        )
+
+        if key in cache:
+
+            cached = cache[
+                key
+            ]
+
+            hospital = str(
+                cached.get(
+                    "hospital",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if hospital:
+                result.at[
+                    idx,
+                    "hospital",
+                ] = hospital
+                result.at[
+                    idx,
+                    "hospital_lookup_method",
+                ] = "주소 웹검색"
+            continue
+
+        pending_by_key.setdefault(
+            key,
+            {
+                "address": address,
+                "merchant": str(
+                    row.get(
+                        "merchant",
+                        "",
+                    )
+                    or ""
+                ),
+                "indices": [],
+            },
+        )[
+            "indices"
+        ].append(
+            idx
+        )
+
+    if not pending_by_key:
+        return result
+
+    max_workers = max(
+        1,
+        min(
+            max_workers,
+            len(
+                pending_by_key
+            ),
+        ),
+    )
+
+    with ThreadPoolExecutor(
+        max_workers=max_workers
+    ) as executor:
+
+        future_map = {}
+
+        for key, payload in pending_by_key.items():
+
+            future = executor.submit(
+                lookup_hospital_by_address_uncached,
+                payload[
+                    "address"
+                ],
+                payload[
+                    "merchant"
+                ],
+            )
+
+            future_map[
+                future
+            ] = (
+                key,
+                payload,
+            )
+
+        for future in as_completed(
+            future_map
+        ):
+
+            key, payload = future_map[
+                future
+            ]
+
+            try:
+                lookup = future.result()
+            except Exception as exc:
+                lookup = {
+                    "hospital": "",
+                    "confidence": 0.0,
+                    "reason": str(exc),
+                }
+
+            cache[
+                key
+            ] = lookup
+
+            hospital = str(
+                lookup.get(
+                    "hospital",
+                    "",
+                )
+                or ""
+            ).strip()
+
+            if not hospital:
+                continue
+
+            for idx in payload[
+                "indices"
+            ]:
+                result.at[
+                    idx,
+                    "hospital",
+                ] = hospital
+                result.at[
+                    idx,
+                    "hospital_lookup_method",
+                ] = "주소 웹검색"
+
+    st.session_state.hospital_lookup_cache = cache
+
+    return result
+
+
+def format_usage_date(date_value):
+    raw = str(date_value or "").strip()
+
+    try:
+        parsed = pd.to_datetime(raw, errors="raise")
+        return f"{parsed.month}/{parsed.day}"
+    except Exception:
+        return raw
+
+
+def get_pdf_korean_font(size, bold=False):
+    font_paths = []
+
+    if bold:
+        font_paths.extend(
+            [
+                r"C:\Windows\Fonts\malgunbd.ttf",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+                "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+            ]
+        )
+
+    font_paths.extend(
+        [
+            r"C:\Windows\Fonts\malgun.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+    )
+
+    for font_path in font_paths:
+        try:
+            if os.path.exists(font_path):
+                return ImageFont.truetype(
+                    font_path,
+                    size=size,
+                )
+        except Exception:
+            continue
+
+    return ImageFont.load_default()
 
 
 def normalize_receipt_time(value):
@@ -941,6 +1947,7 @@ DEFAULT_SESSION = {
     "export_cache_signature": None,
     "fx_rate_cache": {},
     "manual_fx_rates": {},
+    "hospital_lookup_cache": {},
 }
 
 
@@ -1506,9 +2513,10 @@ def apply_manual_fx_rate_to_df(
             idx,
             "confirmed",
         ] = bool(
-            confidence >= 0.90
+            confidence
+            >=
+            HIGH_CONFIDENCE_SOFT_SOURCE_AUTO_APPROVE
             and source_safe
-            and merchant
             and date
             and amount > 0
         )
@@ -1762,8 +2770,26 @@ def normalize_amount_digits(value):
 
 
 def validate_ai_source_integrity(row):
+    """
+    AI 원문 안전성 검증.
 
-    issues = []
+    핵심 원칙:
+    - 금액/외화 환율 관련 오류는 신뢰도와 무관하게 계속 엄격하게 막는다.
+    - 상호 또는 원문 상호를 못 읽은 것은 '비핵심 오류'로 취급한다.
+    - 신뢰도 90% 이상이면 비핵심 오류만 있는 경우 자동 통과시킨다.
+    - 사용자가 원했던 불필요한 '상호 확인' 작업을 줄이되,
+      정산 금액/증빙 안전성은 낮추지 않는다.
+    """
+
+    critical_issues = []
+    soft_issues = []
+
+    confidence = safe_float(
+        row.get(
+            "confidence",
+            0,
+        )
+    )
 
     currency = normalize_currency_code(
         row.get("currency"),
@@ -1785,17 +2811,29 @@ def validate_ai_source_integrity(row):
         or ""
     ).strip()
 
+    # -----------------------------------------------------
+    # 비핵심 오류
+    # -----------------------------------------------------
+    # 주차권/병원 시설 영수증처럼 상호 필드가 비어 있어도
+    # 날짜/금액/분류/병원 사용처가 정상적으로 읽히는 경우가 많다.
+    # 이런 항목은 신뢰도 90% 이상이면 확인 필요로 만들지 않는다.
+    # -----------------------------------------------------
+
     if not merchant:
-        issues.append(
+        soft_issues.append(
             "상호 정보가 비어 있습니다."
         )
 
     # 상호 원문 표기와 정리된 상호를 서로 비교하지 않는다.
     # 영어/태국어/브랜드 표기 차이는 오류 사유가 아니다.
     if not source_merchant:
-        issues.append(
+        soft_issues.append(
             "영수증 원문에서 상호를 직접 확인하지 못했습니다."
         )
+
+    # -----------------------------------------------------
+    # 핵심 오류
+    # -----------------------------------------------------
 
     if currency == "KRW":
 
@@ -1808,17 +2846,17 @@ def validate_ai_source_integrity(row):
         )
 
         if amount <= 0:
-            issues.append(
+            critical_issues.append(
                 "최종 결제금액을 확인할 수 없습니다."
             )
 
         elif source_amount is None:
-            issues.append(
+            critical_issues.append(
                 "영수증 원문에서 결제금액을 직접 확인하지 못했습니다."
             )
 
         elif amount != source_amount:
-            issues.append(
+            critical_issues.append(
                 "AI 입력 금액과 영수증 원문 금액이 일치하지 않습니다."
             )
 
@@ -1833,24 +2871,24 @@ def validate_ai_source_integrity(row):
         )
 
         if original_amount is None or original_amount <= 0:
-            issues.append(
+            critical_issues.append(
                 "외화 최종 결제금액을 확인할 수 없습니다."
             )
 
         elif source_original is None:
-            issues.append(
+            critical_issues.append(
                 "영수증 원문에서 외화 결제금액을 직접 확인하지 못했습니다."
             )
 
         elif abs(original_amount - source_original) > Decimal("0.01"):
-            issues.append(
+            critical_issues.append(
                 "AI가 읽은 외화 금액과 영수증 원문 금액이 일치하지 않습니다."
             )
 
         if not safe_bool(
             row.get("fx_conversion_ok", False)
         ):
-            issues.append(
+            critical_issues.append(
                 str(
                     row.get(
                         "fx_review_reason",
@@ -1861,16 +2899,52 @@ def validate_ai_source_integrity(row):
                 )
             )
 
-        if safe_int(row.get("amount", 0)) <= 0:
-            issues.append(
+        if safe_int(
+            row.get(
+                "amount",
+                0,
+            )
+        ) <= 0:
+            critical_issues.append(
                 "원화 환산금액을 확인할 수 없습니다."
             )
 
+    # 핵심 오류가 하나라도 있으면 무조건 실패.
+    if critical_issues:
+        return (
+            False,
+            " / ".join(
+                dict.fromkeys(
+                    critical_issues
+                )
+            ),
+        )
+
+    # 신뢰도 90% 이상이면 상호 미인식 같은 soft issue는 자동 통과.
+    if (
+        confidence
+        >=
+        HIGH_CONFIDENCE_SOFT_SOURCE_AUTO_APPROVE
+    ):
+        return (
+            True,
+            "",
+        )
+
+    # 90% 미만에서는 기존처럼 soft issue도 확인 필요.
+    if soft_issues:
+        return (
+            False,
+            " / ".join(
+                dict.fromkeys(
+                    soft_issues
+                )
+            ),
+        )
+
     return (
-        len(issues) == 0,
-        " / ".join(
-            dict.fromkeys(issues)
-        ),
+        True,
+        "",
     )
 
 
@@ -2726,7 +3800,7 @@ def get_receipt_analysis_cache_key(
             file_bytes
         )
         +
-        "_receipt_v16_datetime_groups"
+        "_receipt_v21_daily_hospital_usage"
     )
 
 
@@ -2797,6 +3871,23 @@ time:
 
 source_amount_text:
 최종 결제금액 위치에 실제 인쇄된 문자열.
+
+hospital_candidate:
+이 영수증이 어느 병원 방문/주차/원내매장 이용과 관련된 것인지
+이미지 안의 병원명, 시설명, 점포명, 주소 문구로 판단 가능한 경우만 반환한다.
+
+예:
+- 대한외래 -> "대한외래"
+- 서울대학교병원 -> "서울대학교병원"
+- 서울대병원 내부 매장 영수증에서 주소/점포 정보로 서울대학교병원이 명확하면 "서울대학교병원"
+
+병원을 특정할 근거가 없거나 확실하지 않으면 빈 문자열 "".
+병원명을 추측해서 만들지 않는다.
+
+source_address:
+영수증에 실제 인쇄된 사업장/매장/주차장 주소를 가능한 한 원문 그대로 반환한다.
+주소가 없거나 읽을 수 없으면 빈 문자열 "".
+주소를 추측하거나 보완하지 않는다.
 
 items_text:
 실제로 읽히는 품목명만 배열로 반환.
@@ -2886,6 +3977,8 @@ currency
 original_amount
 amount
 source_amount_text
+hospital_candidate
+source_address
 items_text
 category
 confidence
@@ -4583,6 +5676,24 @@ def make_export_signature(
                 ),
                 str(
                     row.get(
+                        "hospital",
+                        "",
+                    )
+                ),
+                str(
+                    row.get(
+                        "source_address",
+                        "",
+                    )
+                ),
+                str(
+                    row.get(
+                        "hospital_lookup_method",
+                        "",
+                    )
+                ),
+                str(
+                    row.get(
                         "amount",
                         "",
                     )
@@ -4661,6 +5772,10 @@ def build_export_image_cache(
         final_df
     )
 
+    final_df = apply_hospital_names(
+        final_df
+    )
+
     signature = make_export_signature(
         final_df
     )
@@ -4736,11 +5851,11 @@ def build_export_image_cache(
             if (
                 max_dimension
                 >
-                2200
+                4000
             ):
 
                 scale = (
-                    2200
+                    4000
                     /
                     max_dimension
                 )
@@ -4764,7 +5879,7 @@ def build_export_image_cache(
                             ),
                         ),
                     ),
-                    Image.Resampling.BILINEAR,
+                    Image.Resampling.LANCZOS,
                 )
 
             cache[
@@ -4796,6 +5911,105 @@ def build_export_image_cache(
     )
 
 
+
+# =========================================================
+# 고해상도 문서 출력용 이미지 보정
+# =========================================================
+
+def resize_for_document_export(
+    image,
+    target_width,
+    target_height,
+):
+    """
+    PDF/JPG에 들어갈 영수증을 고품질로 리사이즈한다.
+
+    - 원본 비율 유지
+    - LANCZOS 사용
+    - 확대가 필요한 경우에만 아주 약한 UnsharpMask 적용
+    - 글자 윤곽을 살리되 OCR/증빙 내용을 변형할 정도의 강한 보정은 하지 않는다
+    """
+
+    source = image.convert(
+        "RGB"
+    )
+
+    width_ratio = (
+        float(
+            target_width
+        )
+        /
+        max(
+            1,
+            source.width,
+        )
+    )
+
+    height_ratio = (
+        float(
+            target_height
+        )
+        /
+        max(
+            1,
+            source.height,
+        )
+    )
+
+    scale = min(
+        width_ratio,
+        height_ratio,
+    )
+
+    target_w = max(
+        1,
+        int(
+            round(
+                source.width
+                *
+                scale
+            )
+        ),
+    )
+
+    target_h = max(
+        1,
+        int(
+            round(
+                source.height
+                *
+                scale
+            )
+        ),
+    )
+
+    resized = source.resize(
+        (
+            target_w,
+            target_h,
+        ),
+        Image.Resampling.LANCZOS,
+    )
+
+    # 저해상도 원본을 확대할 때만 약한 샤프닝.
+    # 이미 충분히 큰 원본은 불필요한 보정을 하지 않는다.
+    if scale > 1.05:
+
+        resized = resized.filter(
+            ImageFilter.UnsharpMask(
+                radius=1.1,
+                percent=115,
+                threshold=3,
+            )
+        )
+
+    return (
+        resized,
+        target_w,
+        target_h,
+    )
+
+
 # =========================================================
 # 25. JPG 생성
 # =========================================================
@@ -4809,7 +6023,7 @@ def create_long_jpg(
         final_df
     )
 
-    target_width = 900
+    target_width = 1800
 
     receipts = []
 
@@ -4855,7 +6069,7 @@ def create_long_jpg(
                         ),
                     ),
                 ),
-                Image.Resampling.BILINEAR,
+                Image.Resampling.LANCZOS,
             )
 
         receipts.append(
@@ -4954,7 +6168,7 @@ def create_long_jpg(
     canvas.save(
         output,
         format="JPEG",
-        quality=91,
+        quality=95,
         optimize=False,
     )
 
@@ -5032,21 +6246,22 @@ def create_pdf(
     # - 캡션, 이미지 슬롯의 상단/하단/열 폭 모두 동일
     # -----------------------------------------------------
 
-    page_width = 1754
-    page_height = 1240
+    page_width = 3508
+    page_height = 2480
 
     columns = 4
     rows = 2
     per_page = 8
 
-    margin_x = 24
-    margin_y = 24
+    margin_x = 48
+    margin_y = 48
 
-    gap_x = 14
-    gap_y = 20
+    gap_x = 28
+    gap_y = 40
 
-    caption_height = 28
-    caption_gap = 6
+    # 기존 상단 날짜/금액 캡션 제거
+    caption_height = 0
+    caption_gap = 0
 
     # 각 영수증이 들어갈 고정 셀
     cell_width = int(
@@ -5074,8 +6289,8 @@ def create_pdf(
     )
 
     # 영수증 이미지 자체가 들어가는 고정 슬롯
-    slot_padding_x = 10
-    slot_padding_y = 10
+    slot_padding_x = 20
+    slot_padding_y = 20
 
     slot_width = (
         cell_width
@@ -5166,25 +6381,6 @@ def create_pdf(
 
 
             # ---------------------------------------------
-            # 캡션 위치 고정
-            # ---------------------------------------------
-
-            caption = (
-                f"{row['date']}  "
-                f"{safe_int(row['amount']):,}원"
-            )
-
-            draw.text(
-                (
-                    cell_x + 4,
-                    cell_y + 2,
-                ),
-                caption,
-                fill="#333333",
-            )
-
-
-            # ---------------------------------------------
             # 고정 이미지 슬롯 생성
             # ---------------------------------------------
             # 슬롯 자체 크기는 모든 영수증에서 완전히 동일하다.
@@ -5200,80 +6396,13 @@ def create_pdf(
                 "white",
             )
 
-            image = source_image.convert(
-                "RGB"
-            )
-
-            width_ratio = (
-                slot_width
-                /
-                max(
-                    1,
-                    image.width,
+            resized, target_width, target_height = (
+                resize_for_document_export(
+                    source_image,
+                    slot_width,
+                    slot_height,
                 )
             )
-
-            height_ratio = (
-                slot_height
-                /
-                max(
-                    1,
-                    image.height,
-                )
-            )
-
-            # 이미지가 작은 경우에도 PDF에서 너무 작게 보이지 않도록
-            # 슬롯 범위 안에서는 확대를 허용한다.
-            scale = min(
-                width_ratio,
-                height_ratio,
-            )
-
-            target_width = max(
-                1,
-                int(
-                    round(
-                        image.width
-                        *
-                        scale
-                    )
-                ),
-            )
-
-            target_height = max(
-                1,
-                int(
-                    round(
-                        image.height
-                        *
-                        scale
-                    )
-                ),
-            )
-
-            if (
-                target_width
-                !=
-                image.width
-
-                or
-
-                target_height
-                !=
-                image.height
-            ):
-
-                resized = image.resize(
-                    (
-                        target_width,
-                        target_height,
-                    ),
-                    Image.Resampling.LANCZOS,
-                )
-
-            else:
-
-                resized = image
 
 
             # 영수증을 동일 고정 슬롯 중앙에 배치
@@ -5321,10 +6450,6 @@ def create_pdf(
             slot_y = (
                 cell_y
                 +
-                caption_height
-                +
-                caption_gap
-                +
                 slot_padding_y
             )
 
@@ -5350,7 +6475,7 @@ def create_pdf(
                     slot_y + slot_height - 1,
                 ),
                 outline="#F2F2F2",
-                width=1,
+                width=2,
             )
 
 
@@ -5375,7 +6500,7 @@ def create_pdf(
                         cell_y + cell_height,
                     ),
                     fill="#F3F3F3",
-                    width=1,
+                    width=2,
                 )
 
 
@@ -5398,7 +6523,7 @@ def create_pdf(
                 separator_y,
             ),
             fill="#ECECEC",
-            width=1,
+            width=2,
         )
 
         pages.append(
@@ -5415,7 +6540,7 @@ def create_pdf(
         append_images=(
             pages[1:]
         ),
-        resolution=150.0,
+        resolution=300.0,
     )
 
     output.seek(
@@ -5437,6 +6562,10 @@ def create_excel(
         final_df
     )
 
+    work_df = apply_hospital_names(
+        work_df
+    )
+
     work_df[
         "settlement_group"
     ] = (
@@ -5452,6 +6581,9 @@ def create_excel(
         "date",
         "time",
         "merchant",
+        "hospital",
+        "source_address",
+        "hospital_lookup_method",
         "category",
         "settlement_group",
         "amount",
@@ -5513,6 +6645,9 @@ def create_excel(
         "날짜",
         "시간",
         "상호",
+        "병원",
+        "영수증원문_주소",
+        "병원매칭방식",
         "계정과목",
         "정산구분",
         "금액",
@@ -6081,6 +7216,10 @@ if (
                     )
                 )
 
+                result = apply_merchant_rule_db(
+                    result
+                )
+
                 result = apply_currency_conversion(
                     result
                 )
@@ -6140,6 +7279,11 @@ if (
                 "original_amount",
                 "amount",
                 "source_amount_text",
+                "hospital_candidate",
+                "source_address",
+                "hospital",
+                "hospital_lookup_method",
+                "merchant_rule_applied",
                 "exchange_rate",
                 "exchange_rate_date",
                 "exchange_rate_status",
@@ -6277,13 +7421,23 @@ if (
                 axis=1,
             )
 
+            df = apply_hospital_names(
+                df
+            )
+
+            # DB/영수증 정보로 병원을 못 찾은 행만
+            # 영수증 주소를 이용해 웹에서 관련 병원을 보완한다.
+            df = enrich_unknown_hospitals_by_address(
+                df
+            )
+
             df = add_ai_safety_status(
                 df
             )
 
-            # 핵심값이 정상이라면 AI가 needs_review=true를 반환했다는 이유만으로
-            # 자동 확정을 막지 않는다.
-            # 실제 확인 필요 여부는 원문 안전성, 핵심값, 신뢰도, 증빙 상태로 판단한다.
+            # 신뢰도 90% 이상이고 핵심 금액/원문이 안전하면 자동 확정한다.
+            # 상호 또는 원문 상호를 못 읽은 비핵심 오류만으로는 확인 필요로 보내지 않는다.
+            # 금액 불일치, 외화 환율, 증빙 잘림, 중복은 기존처럼 별도 안전검증한다.
             df[
                 "confirmed"
             ] = (
@@ -6292,7 +7446,7 @@ if (
                         "confidence"
                     ]
                     >=
-                    0.90
+                    HIGH_CONFIDENCE_SOFT_SOURCE_AUTO_APPROVE
                 )
                 &
                 (
@@ -6305,10 +7459,6 @@ if (
                 &
                 df[
                     "date"
-                ].notna()
-                &
-                df[
-                    "merchant"
                 ].notna()
                 &
                 (
@@ -6914,6 +8064,12 @@ if (
                     "merchant"
                 ],
 
+            "병원":
+                filtered_df.apply(
+                    resolve_hospital_name,
+                    axis=1,
+                ),
+
             "금액":
                 pd.to_numeric(
                     filtered_df[
@@ -7143,6 +8299,28 @@ if (
                             "",
                         )
                     )
+
+                    st.caption(
+                        "병원 매칭: "
+                        +
+                        resolve_hospital_name(
+                            row
+                        )
+                    )
+
+                    merchant_rule_applied = str(
+                        row.get(
+                            "merchant_rule_applied",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+
+                    if merchant_rule_applied:
+
+                        st.caption(
+                            f"규칙 DB 적용: {merchant_rule_applied}"
+                        )
 
                     currency = normalize_currency_code(
                         row.get("currency"),
@@ -7509,6 +8687,17 @@ if (
                                 value=merchant,
                             )
 
+                            edit_hospital = st.text_input(
+                                "병원/사용처",
+                                value=resolve_hospital_name(
+                                    row
+                                ),
+                                help=(
+                                    "날짜별 사용내역에 반영됩니다. "
+                                    "대한외래는 서울대병원으로 자동 매칭됩니다."
+                                ),
+                            )
+
                             edit_amount = st.number_input(
                                 "금액",
                                 min_value=0,
@@ -7593,6 +8782,15 @@ if (
                                 mask,
                                 "merchant",
                             ] = edit_merchant
+
+                            updated.loc[
+                                mask,
+                                "hospital",
+                            ] = (
+                                edit_hospital.strip()
+                                or
+                                "병원 확인 필요"
+                            )
 
                             updated.loc[
                                 mask,
@@ -8018,6 +9216,401 @@ if (
                     "식대·음료에 포함된 확정 영수증이 없습니다."
                 )
 
+
+
+    # =====================================================
+    # 사용내역
+    # =====================================================
+
+    if not latest_df.empty:
+
+        section(
+            "사용내역",
+            (
+                "어떤 날 어떤 병원을 방문했는지만 날짜별로 정리합니다. "
+                "같은 날 같은 병원의 여러 영수증은 한 줄로 합칩니다. "
+                "병원을 확인하지 못한 날짜는 직접 입력할 수 있습니다."
+            ),
+        )
+
+        usage_source = sort_receipts_chronologically(
+            apply_hospital_names(
+                latest_df
+            )
+        )
+
+        usage_source = usage_source.reset_index(
+            drop=True
+        )
+
+        # -------------------------------------------------
+        # 날짜별 병원 사용내역 생성
+        # -------------------------------------------------
+        # 같은 날짜 + 같은 병원은 한 줄로 합치고,
+        # 같은 날짜에 서로 다른 병원이 있으면 병원별로 각각 표시한다.
+        # 병원 확인 필요도 날짜별 한 줄만 유지한다.
+        # -------------------------------------------------
+
+        usage_rows = []
+
+        for usage_date, date_group in usage_source.groupby(
+            "date",
+            dropna=False,
+            sort=False,
+        ):
+
+            date_group = sort_receipts_chronologically(
+                date_group
+            )
+
+            hospitals = []
+
+            for _, row in date_group.iterrows():
+
+                hospital_name = resolve_hospital_name(
+                    row
+                )
+
+                if hospital_name not in hospitals:
+                    hospitals.append(
+                        hospital_name
+                    )
+
+            # 확정된 병원이 하나라도 있으면 동일 날짜의
+            # '병원 확인 필요'는 화면에서 제거한다.
+            confirmed_hospitals = [
+                hospital
+                for hospital in hospitals
+                if hospital
+                and
+                hospital
+                !=
+                "병원 확인 필요"
+            ]
+
+            if confirmed_hospitals:
+                hospitals = confirmed_hospitals
+
+            if not hospitals:
+                hospitals = [
+                    "병원 확인 필요"
+                ]
+
+            # 해당 날짜에서 주소 후보 수집
+            addresses = []
+
+            if "source_address" in date_group.columns:
+
+                for address in (
+                    date_group[
+                        "source_address"
+                    ]
+                    .fillna("")
+                    .astype(str)
+                    .tolist()
+                ):
+
+                    address = address.strip()
+
+                    if (
+                        address
+                        and
+                        address
+                        not in addresses
+                    ):
+                        addresses.append(
+                            address
+                        )
+
+            for hospital_name in hospitals:
+
+                # 이 날짜의 어떤 receipt가 해당 병원에 연결되는지 보관.
+                receipt_ids = []
+
+                for _, row in date_group.iterrows():
+
+                    resolved = resolve_hospital_name(
+                        row
+                    )
+
+                    if (
+                        resolved
+                        ==
+                        hospital_name
+                    ):
+
+                        receipt_ids.append(
+                            str(
+                                row.get(
+                                    "receipt_id",
+                                    "",
+                                )
+                            )
+                        )
+
+                # 병원 확인 필요인 경우에는 날짜 전체 receipt에 적용 가능하도록
+                # 해당 날짜 모든 receipt_id를 묶는다.
+                if (
+                    hospital_name
+                    ==
+                    "병원 확인 필요"
+                ):
+
+                    receipt_ids = [
+                        str(
+                            value
+                        )
+                        for value in date_group[
+                            "receipt_id"
+                        ].tolist()
+                    ]
+
+                usage_rows.append(
+                    {
+                        "_usage_date":
+                            str(
+                                usage_date
+                                or ""
+                            ),
+
+                        "_receipt_ids":
+                            "|||".join(
+                                receipt_ids
+                            ),
+
+                        "날짜":
+                            format_usage_date(
+                                usage_date
+                            ),
+
+                        "병원":
+                            hospital_name,
+
+                        "주소 참고":
+                            " / ".join(
+                                addresses[:2]
+                            ),
+                    }
+                )
+
+        usage_editor_df = pd.DataFrame(
+            usage_rows
+        )
+
+        with st.form(
+            "usage_history_editor_form",
+            clear_on_submit=False,
+        ):
+
+            edited_usage = st.data_editor(
+                usage_editor_df,
+                hide_index=True,
+                use_container_width=True,
+                column_order=[
+                    "날짜",
+                    "병원",
+                    "주소 참고",
+                ],
+                disabled=[
+                    "날짜",
+                    "주소 참고",
+                ],
+                column_config={
+                    "병원":
+                        st.column_config.TextColumn(
+                            "병원",
+                            help=(
+                                "병원 확인 필요로 표시된 날짜는 "
+                                "직접 병원명을 입력하세요."
+                            ),
+                            width="medium",
+                        ),
+
+                    "주소 참고":
+                        st.column_config.TextColumn(
+                            "주소 참고",
+                            help=(
+                                "병원명이 불명확할 때 영수증에서 읽은 주소를 참고하세요."
+                            ),
+                            width="large",
+                        ),
+                },
+                key="usage_history_editor",
+            )
+
+            save_usage = st.form_submit_button(
+                "사용내역 저장",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if save_usage:
+
+            updated = (
+                st.session_state
+                .receipt_df
+                .copy()
+            )
+
+            changed = 0
+
+            for row_index, usage_row in edited_usage.iterrows():
+
+                hospital_value = str(
+                    usage_row.get(
+                        "병원",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+                if not hospital_value:
+                    hospital_value = "병원 확인 필요"
+
+                original_row = usage_editor_df.iloc[
+                    row_index
+                ]
+
+                original_hospital = str(
+                    original_row.get(
+                        "병원",
+                        "",
+                    )
+                    or ""
+                ).strip()
+
+                if hospital_value == original_hospital:
+                    continue
+
+                receipt_ids = [
+                    value
+                    for value in str(
+                        original_row.get(
+                            "_receipt_ids",
+                            "",
+                        )
+                        or ""
+                    ).split(
+                        "|||"
+                    )
+                    if value
+                ]
+
+                if not receipt_ids:
+                    continue
+
+                mask = (
+                    updated[
+                        "receipt_id"
+                    ].astype(str)
+                    .isin(
+                        receipt_ids
+                    )
+                )
+
+                if not mask.any():
+                    continue
+
+                updated.loc[
+                    mask,
+                    "hospital",
+                ] = hospital_value
+
+                updated.loc[
+                    mask,
+                    "hospital_lookup_method",
+                ] = "사용자 입력"
+
+                changed += 1
+
+            st.session_state.receipt_df = updated
+
+            invalidate_generated_files()
+
+            set_flash(
+                (
+                    f"날짜별 사용내역을 저장했습니다. {changed}건 수정"
+                    if changed
+                    else
+                    "사용내역을 확인했습니다."
+                )
+            )
+
+            st.rerun()
+
+        # 병원 확인이 안 된 날짜만 주소 검색 재시도.
+        unresolved_dates = []
+
+        for usage_date, date_group in usage_source.groupby(
+            "date",
+            dropna=False,
+            sort=False,
+        ):
+
+            resolved_hospitals = {
+                resolve_hospital_name(
+                    row
+                )
+                for _, row in date_group.iterrows()
+            }
+
+            has_confirmed = any(
+                hospital
+                and
+                hospital
+                !=
+                "병원 확인 필요"
+                for hospital in resolved_hospitals
+            )
+
+            has_address = (
+                "source_address"
+                in
+                date_group.columns
+                and
+                date_group[
+                    "source_address"
+                ]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .ne("")
+                .any()
+            )
+
+            if (
+                not has_confirmed
+                and
+                has_address
+            ):
+                unresolved_dates.append(
+                    usage_date
+                )
+
+        if unresolved_dates:
+
+            if st.button(
+                (
+                    "병원 확인 필요 "
+                    f"{len(unresolved_dates)}일 주소로 다시 검색"
+                ),
+                use_container_width=False,
+                key="retry_hospital_address_lookup",
+            ):
+
+                refreshed = enrich_unknown_hospitals_by_address(
+                    st.session_state.receipt_df
+                )
+
+                st.session_state.receipt_df = refreshed
+
+                invalidate_generated_files()
+
+                set_flash(
+                    "영수증 주소를 기준으로 날짜별 병원 후보를 다시 검색했습니다."
+                )
+
+                st.rerun()
 
 
 
