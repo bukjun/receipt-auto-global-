@@ -6627,63 +6627,54 @@ def create_pdf(
     ):
         """
         일반 이미지 영수증용.
-        2열 x 2행 = 페이지당 최대 4개.
+
+        목표:
+        - 페이지당 최대 4개
+        - 영수증 4장을 한 줄에 나란히 배치
+        - 페이지의 가로/세로 공간을 최대한 사용
+        - 각 영수증은 종횡비 유지
+        - 4장 전체가 들어가는 범위에서 공통 배율을 최대화
+        - crop / stretch / 왜곡 없음
         """
 
         if not receipt_items:
             return
 
-        columns = 2
-        rows = 2
         per_page = 4
 
-        gap_x = 36
-        gap_y = 42
+        # 페이지를 최대한 꽉 쓰기 위해 간격 최소화
+        receipt_gap = 12
 
         top_reserved = (
-            88
+            76
             if section_label
             else 0
         )
 
         usable_top = (
-            margin_y
+            18
             +
             top_reserved
         )
 
-        usable_height = (
+        usable_bottom = (
             page_height
             -
-            usable_top
+            18
+        )
+
+        usable_height = max(
+            1,
+            usable_bottom
             -
-            margin_y
+            usable_top
         )
 
-        cell_width = int(
-            (
-                page_width
-                -
-                margin_x * 2
-                -
-                gap_x
-            )
-            /
-            columns
+        available_width = (
+            page_width
+            -
+            28
         )
-
-        cell_height = int(
-            (
-                usable_height
-                -
-                gap_y
-            )
-            /
-            rows
-        )
-
-        slot_padding_x = 24
-        slot_padding_y = 24
 
         for page_start in range(
             0,
@@ -6699,151 +6690,244 @@ def create_pdf(
                     section_label,
                 )
 
-            draw = ImageDraw.Draw(
-                page
-            )
-
             current_receipts = receipt_items[
                 page_start:
                 page_start + per_page
             ]
 
-            for slot_index, (
-                row,
-                source_image,
-            ) in enumerate(
-                current_receipts
-            ):
+            sources = []
 
-                row_index = (
-                    slot_index
-                    // columns
+            for row, source_image in current_receipts:
+
+                source = source_image.convert(
+                    "RGB"
                 )
 
-                column_index = (
-                    slot_index
-                    % columns
+                if (
+                    source.width <= 0
+                    or
+                    source.height <= 0
+                ):
+                    continue
+
+                sources.append(
+                    {
+                        "row": row,
+                        "source": source,
+                    }
                 )
 
-                cell_x = (
-                    margin_x
-                    +
-                    column_index
-                    *
-                    (
-                        cell_width
-                        +
-                        gap_x
-                    )
-                )
+            if not sources:
+                continue
 
-                cell_y = (
-                    usable_top
-                    +
-                    row_index
-                    *
-                    (
-                        cell_height
-                        +
-                        gap_y
-                    )
-                )
+            # ---------------------------------------------
+            # 핵심:
+            # 모든 영수증에 동일한 공통 배율을 적용해
+            # 가로폭과 세로높이 중 먼저 한계에 닿는 쪽까지 최대 확대.
+            #
+            # 이렇게 하면 4장을 한 줄로 유지하면서도
+            # 페이지 공간을 최대한 사용한다.
+            # ---------------------------------------------
 
-                slot_x1 = (
-                    cell_x
-                    +
-                    slot_padding_x
-                )
-
-                slot_y1 = (
-                    cell_y
-                    +
-                    slot_padding_y
-                )
-
-                slot_x2 = (
-                    cell_x
-                    +
-                    cell_width
-                    -
-                    slot_padding_x
-                )
-
-                slot_y2 = (
-                    cell_y
-                    +
-                    cell_height
-                    -
-                    slot_padding_y
-                )
-
-                paste_image_contain(
-                    page,
-                    source_image,
-                    (
-                        slot_x1,
-                        slot_y1,
-                        slot_x2,
-                        slot_y2,
-                    ),
-                )
-
-                draw.rectangle(
-                    (
-                        slot_x1,
-                        slot_y1,
-                        slot_x2,
-                        slot_y2,
-                    ),
-                    outline="#F1F1F3",
-                    width=2,
-                )
-
-            # 중앙 세로 구분선
-            separator_x = (
-                margin_x
-                +
-                cell_width
-                +
-                gap_x
-                // 2
+            total_source_width = sum(
+                item["source"].width
+                for item in sources
             )
 
-            draw.line(
+            max_source_height = max(
+                item["source"].height
+                for item in sources
+            )
+
+            total_gap = (
+                receipt_gap
+                *
+                max(
+                    0,
+                    len(sources) - 1,
+                )
+            )
+
+            scale_by_width = (
                 (
-                    separator_x,
-                    usable_top,
-                    separator_x,
-                    page_height - margin_y,
-                ),
-                fill="#F3F3F3",
-                width=2,
+                    available_width
+                    -
+                    total_gap
+                )
+                /
+                max(
+                    1,
+                    total_source_width,
+                )
             )
 
-            # 중앙 가로 구분선
-            separator_y = (
+            scale_by_height = (
+                usable_height
+                /
+                max(
+                    1,
+                    max_source_height,
+                )
+            )
+
+            # 최대 2배 업스케일 제한은 기존 화질/메모리 정책 유지
+            common_scale = max(
+                0.01,
+                min(
+                    scale_by_width,
+                    scale_by_height,
+                    2.0,
+                ),
+            )
+
+            rendered = []
+
+            for item in sources:
+
+                source = item["source"]
+
+                target_w = max(
+                    1,
+                    int(
+                        round(
+                            source.width
+                            *
+                            common_scale
+                        )
+                    ),
+                )
+
+                target_h = max(
+                    1,
+                    int(
+                        round(
+                            source.height
+                            *
+                            common_scale
+                        )
+                    ),
+                )
+
+                resized = source.resize(
+                    (
+                        target_w,
+                        target_h,
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
+
+                if common_scale > 1.05:
+
+                    resized = resized.filter(
+                        ImageFilter.UnsharpMask(
+                            radius=1.1,
+                            percent=115,
+                            threshold=3,
+                        )
+                    )
+
+                rendered.append(
+                    {
+                        "image": resized,
+                        "width": target_w,
+                        "height": target_h,
+                    }
+                )
+
+            group_width = (
+                sum(
+                    item["width"]
+                    for item in rendered
+                )
+                +
+                total_gap
+            )
+
+            current_x = max(
+                14,
+                int(
+                    round(
+                        (
+                            page_width
+                            -
+                            group_width
+                        )
+                        /
+                        2
+                    )
+                ),
+            )
+
+            page_center_y = (
                 usable_top
                 +
-                cell_height
-                +
-                gap_y
-                // 2
+                usable_bottom
+            ) / 2.0
+
+            draw = ImageDraw.Draw(
+                page
             )
 
-            draw.line(
-                (
-                    margin_x,
-                    separator_y,
-                    page_width - margin_x,
-                    separator_y,
-                ),
-                fill="#F3F3F3",
-                width=2,
-            )
+            for item in rendered:
+
+                paste_y = int(
+                    round(
+                        page_center_y
+                        -
+                        item["height"]
+                        /
+                        2.0
+                    )
+                )
+
+                paste_y = max(
+                    usable_top,
+                    min(
+                        paste_y,
+                        usable_bottom
+                        -
+                        item["height"],
+                    ),
+                )
+
+                page.paste(
+                    item["image"],
+                    (
+                        current_x,
+                        paste_y,
+                    ),
+                )
+
+                # 아주 옅은 테두리만 유지
+                draw.rectangle(
+                    (
+                        current_x,
+                        paste_y,
+                        current_x
+                        +
+                        item["width"]
+                        -
+                        1,
+                        paste_y
+                        +
+                        item["height"]
+                        -
+                        1,
+                    ),
+                    outline="#F5F5F5",
+                    width=1,
+                )
+
+                current_x += (
+                    item["width"]
+                    +
+                    receipt_gap
+                )
 
             pages.append(
                 page
             )
+
 
     def render_one_per_page(
         receipt_items,
