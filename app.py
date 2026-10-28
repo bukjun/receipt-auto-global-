@@ -52,6 +52,14 @@ client = OpenAI(
 # 1차 영수증 AI 분석 병렬 처리 수
 FIRST_PASS_MAX_WORKERS = 4
 
+# 2차 증빙 AI 검증 병렬 처리 수
+# 1차보다 보수적으로 3개만 동시에 실행한다.
+EVIDENCE_VALIDATION_MAX_WORKERS = 3
+
+# 2차 증빙 검증용 이미지 최적화
+# 기존 1200px보다 약간 크게 유지해 작은 글자/최종금액 판독률을 높인다.
+EVIDENCE_VALIDATION_MAX_SIDE = 1400
+
 # 1차 AI 전송용 이미지 최적화
 # 원본 증빙 이미지는 그대로 보존하고, AI에 보내는 사본만 축소한다.
 FIRST_PASS_AI_MAX_SIDE = 1800
@@ -467,26 +475,31 @@ def build_receipt_rule_text(row_or_result):
                 )
                 or ""
             ),
+            str(
+                row.get(
+                    "source_address",
+                    "",
+                )
+                or ""
+            ),
             items_text,
         ]
     )
 
 
-def find_merchant_rule(
-    row_or_result
-):
+_MERCHANT_RULE_CANDIDATES = None
+
+
+def get_merchant_rule_candidates():
     """
-    가장 긴 alias부터 검색해 너무 짧은 키워드의 오탐을 줄인다.
+    거래처 alias 목록은 코드 실행 중 변하지 않으므로 한 번만 정규화/정렬한다.
+    영수증마다 같은 DB를 다시 정규화하는 불필요한 CPU 작업을 줄인다.
     """
 
-    combined = normalize_rule_text(
-        build_receipt_rule_text(
-            row_or_result
-        )
-    )
+    global _MERCHANT_RULE_CANDIDATES
 
-    if not combined:
-        return None
+    if _MERCHANT_RULE_CANDIDATES is not None:
+        return _MERCHANT_RULE_CANDIDATES
 
     candidates = []
 
@@ -515,20 +528,35 @@ def find_merchant_rule(
             )
 
     candidates.sort(
-        key=lambda item: item[
-            0
-        ],
+        key=lambda item: item[0],
         reverse=True,
     )
 
-    for _, alias_normalized, rule in candidates:
+    _MERCHANT_RULE_CANDIDATES = candidates
 
-        if (
-            alias_normalized
-            in
-            combined
-        ):
+    return _MERCHANT_RULE_CANDIDATES
 
+
+def find_merchant_rule(
+    row_or_result
+):
+    """
+    가장 긴 alias부터 검색해 너무 짧은 키워드의 오탐을 줄인다.
+    상호/원문/병원후보/주소/품목을 함께 사용한다.
+    """
+
+    combined = normalize_rule_text(
+        build_receipt_rule_text(
+            row_or_result
+        )
+    )
+
+    if not combined:
+        return None
+
+    for _, alias_normalized, rule in get_merchant_rule_candidates():
+
+        if alias_normalized in combined:
             return rule
 
     return None
@@ -685,6 +713,7 @@ def resolve_hospital_name(row_or_result):
             str(row.get("source_merchant_text", "") or ""),
             str(row.get("source_date_text", "") or ""),
             str(row.get("hospital_candidate", "") or ""),
+            str(row.get("source_address", "") or ""),
             items_text,
         ]
     )
@@ -1791,10 +1820,12 @@ def normalize_category_by_receipt_context(
     result
 ):
     """
-    명확한 통행료 영수증을 후처리로 보강한다.
+    AI 분류 후처리.
 
-    '고속도로'라는 단어 하나만으로는 휴게소 식사/구매 영수증을
-    잘못 분류할 수 있으므로 강한 통행료 키워드만 사용한다.
+    원칙:
+    - 모델에게 다시 물어보지 않고 영수증에 직접 보이는 강한 키워드만 사용한다.
+    - 통행료 / 주차비 / 유류비처럼 형식이 명확한 항목만 코드에서 보정한다.
+    - 식대/카페처럼 문맥이 필요한 항목은 기존 AI/거래처 DB 판단을 유지한다.
     """
 
     row = dict(
@@ -1844,6 +1875,13 @@ def normalize_category_by_receipt_context(
                 )
                 or ""
             ),
+            str(
+                row.get(
+                    "source_address",
+                    "",
+                )
+                or ""
+            ),
             items_text,
         ]
     ).lower()
@@ -1857,20 +1895,54 @@ def normalize_category_by_receipt_context(
         "toll gate",
         "tollgate",
         "toll fee",
-        "toll",
         "한국도로공사",
         "도로공사",
         "고속도로 통행료",
         "유료도로",
     ]
 
+    parking_keywords = [
+        "주차요금",
+        "주차료",
+        "주차장",
+        "주차시간",
+        "입차일시",
+        "출차일시",
+        "정산기",
+        "parking fee",
+        "parking receipt",
+    ]
+
+    fuel_keywords = [
+        "휘발유",
+        "경유",
+        "고급휘발유",
+        "보통휘발유",
+        "주유기",
+        "주유량",
+        "주유금액",
+        "gasoline",
+        "diesel",
+        "fuel amount",
+    ]
+
     if any(
         keyword in combined
         for keyword in toll_keywords
     ):
-        row[
-            "category"
-        ] = "통행료"
+        row["category"] = "통행료"
+
+    elif any(
+        keyword in combined
+        for keyword in parking_keywords
+    ):
+        row["category"] = "주차비"
+
+    elif any(
+        keyword in combined
+        for keyword in fuel_keywords
+    ):
+        row["category"] = "유류비"
 
     return row
 
@@ -2060,11 +2132,23 @@ for key, value in DEFAULT_SESSION.items():
 # 7. 기본 함수
 # =========================================================
 
-def invalidate_generated_files():
+def invalidate_generated_files(
+    preserve_export_images=False,
+):
+    """
+    생성된 다운로드 파일은 무효화한다.
+
+    preserve_export_images=True:
+    - 확정/증빙승인/환율처럼 증빙 픽셀 자체가 바뀌지 않는 작업에서는
+      이미 준비된 export 이미지를 보존한다.
+    - 이후 정산파일 재생성 시 새로 최종대상이 된 영수증만 추가로 준비한다.
+    """
 
     st.session_state.generated_files = None
-    st.session_state.export_image_cache = {}
     st.session_state.export_cache_signature = None
+
+    if not preserve_export_images:
+        st.session_state.export_image_cache = {}
 
 
 def safe_int(value):
@@ -2078,7 +2162,15 @@ def safe_int(value):
 def safe_float(value):
 
     try:
-        return float(value)
+        number = float(value)
+
+        if not np.isfinite(
+            number
+        ):
+            return 0.0
+
+        return number
+
     except Exception:
         return 0.0
 
@@ -2440,12 +2532,12 @@ def apply_manual_fx_rate_to_df(
     rate,
 ):
     """
-    특정 통화의 모든 영수증에 사용자가 입력한 환율을 적용한다.
+    특정 통화 영수증에 사용자가 입력한 환율을 적용한다.
 
-    - original_amount는 원통화 금액 그대로 보존
-    - amount만 KRW 환산금액으로 계산
-    - 증빙 이미지/crop 상태는 변경하지 않음
-    - 환율 입력 후 AI 원문 안전상태와 자동확정 상태만 다시 계산
+    성능 원칙:
+    - 해당 통화 행만 다시 계산한다.
+    - 증빙 crop / 중복 / 다른 영수증 상태는 다시 계산하지 않는다.
+    - original_amount는 원통화 금액 그대로 보존한다.
     """
 
     result = df.copy()
@@ -2465,13 +2557,19 @@ def apply_manual_fx_rate_to_df(
     ):
         return result
 
-    mask = (
+    normalized_currency_series = (
         result[
             "currency"
         ]
         .fillna("")
         .astype(str)
-        .str.upper()
+        .apply(
+            normalize_currency_code
+        )
+    )
+
+    mask = (
+        normalized_currency_series
         ==
         currency
     )
@@ -2517,6 +2615,40 @@ def apply_manual_fx_rate_to_df(
             ]
         )
 
+        # original_amount가 비정상인 과거 결과만 source_amount_text로 보완.
+        if (
+            original_amount is None
+            or
+            original_amount <= 0
+        ):
+
+            source_candidates = extract_amount_candidates(
+                result.at[
+                    idx,
+                    "source_amount_text",
+                ]
+            )
+
+            positive_candidates = [
+                value
+                for value in source_candidates
+                if value > 0
+            ]
+
+            if len(
+                positive_candidates
+            ) == 1:
+                original_amount = positive_candidates[
+                    0
+                ]
+
+                result.at[
+                    idx,
+                    "original_amount",
+                ] = float(
+                    original_amount
+                )
+
         if (
             original_amount is None
             or
@@ -2555,78 +2687,78 @@ def apply_manual_fx_rate_to_df(
             )
         )
 
-    result = add_ai_safety_status(
-        result
-    )
-
-    for idx in result[
-        mask
-    ].index:
-
+        # 해당 행만 AI 원문 안전성 재평가.
         if safe_bool(
             result.at[
                 idx,
                 "manual_override",
             ]
         ):
-            continue
 
-        confidence = safe_float(
-            result.at[
-                idx,
-                "confidence",
-            ]
-        )
-
-        merchant = str(
-            result.at[
-                idx,
-                "merchant",
-            ]
-            or ""
-        ).strip()
-
-        date = str(
-            result.at[
-                idx,
-                "date",
-            ]
-            or ""
-        ).strip()
-
-        amount = safe_int(
-            result.at[
-                idx,
-                "amount",
-            ]
-        )
-
-        source_safe = safe_bool(
             result.at[
                 idx,
                 "ai_source_safe",
-            ]
-        )
+            ] = True
 
-        result.at[
-            idx,
-            "confirmed",
-        ] = bool(
-            confidence
-            >=
-            HIGH_CONFIDENCE_SOFT_SOURCE_AUTO_APPROVE
-            and source_safe
-            and date
-            and amount > 0
-        )
+            result.at[
+                idx,
+                "ai_safety_issue",
+            ] = ""
 
-    result = add_duplicate_flags(
-        result
-    )
+        else:
 
-    result = add_final_evidence_status(
-        result
-    )
+            safe, issue = validate_ai_source_integrity(
+                result.loc[
+                    idx
+                ]
+            )
+
+            result.at[
+                idx,
+                "ai_source_safe",
+            ] = safe
+
+            result.at[
+                idx,
+                "ai_safety_issue",
+            ] = issue
+
+            confidence = safe_float(
+                result.at[
+                    idx,
+                    "confidence",
+                ]
+            )
+
+            date = str(
+                result.at[
+                    idx,
+                    "date",
+                ]
+                or ""
+            ).strip()
+
+            amount = safe_int(
+                result.at[
+                    idx,
+                    "amount",
+                ]
+            )
+
+            result.at[
+                idx,
+                "confirmed",
+            ] = bool(
+                confidence
+                >=
+                HIGH_CONFIDENCE_SOFT_SOURCE_AUTO_APPROVE
+                and
+                safe
+                and
+                date
+                and
+                amount > 0
+            )
 
     return result
 
@@ -2868,6 +3000,122 @@ def normalize_amount_digits(value):
         return None
 
 
+
+def extract_amount_candidates(
+    value
+):
+    """
+    원문 문자열 안에 실제로 독립적으로 표시된 금액 후보를 추출한다.
+
+    예:
+    "합계 19,500 결제금액 19,500"
+    -> [Decimal("19500"), Decimal("19500")]
+
+    기존처럼 모든 숫자를 하나로 이어 붙이지 않는다.
+    날짜/승인번호 등이 들어와도 '기대 금액이 후보 중 실제 존재하는지'만 확인한다.
+    """
+
+    raw = str(
+        value
+        or ""
+    ).strip()
+
+    if not raw:
+        return []
+
+    tokens = re.findall(
+        r"(?<![0-9])(?:[0-9]{1,3}(?:[,\s][0-9]{3})+|[0-9]+)(?:\.[0-9]{1,2})?(?![0-9])",
+        raw,
+    )
+
+    candidates = []
+
+    for token in tokens:
+
+        parsed = parse_decimal_amount(
+            token
+        )
+
+        if parsed is None:
+            continue
+
+        candidates.append(
+            parsed
+        )
+
+    return candidates
+
+
+def source_amount_matches_expected(
+    source_text,
+    expected_amount,
+    currency="KRW",
+):
+    """
+    AI가 정리한 금액이 source_amount_text 안에 실제 금액 후보로 존재하는지 확인.
+
+    - KRW는 정수 금액 정확히 일치
+    - 외화는 소수점 0.01 이내 일치
+    - 같은 최종금액이 원문에 여러 번 반복되어도 정상 처리
+    """
+
+    candidates = extract_amount_candidates(
+        source_text
+    )
+
+    if not candidates:
+        return False
+
+    if str(
+        currency
+        or ""
+    ).upper() == "KRW":
+
+        expected = safe_int(
+            expected_amount
+        )
+
+        if expected <= 0:
+            return False
+
+        return any(
+            int(
+                round(
+                    float(
+                        candidate
+                    )
+                )
+            )
+            ==
+            expected
+            for candidate in candidates
+        )
+
+    expected = parse_decimal_amount(
+        expected_amount
+    )
+
+    if (
+        expected is None
+        or
+        expected <= 0
+    ):
+        return False
+
+    return any(
+        abs(
+            candidate
+            -
+            expected
+        )
+        <=
+        Decimal(
+            "0.01"
+        )
+        for candidate in candidates
+    )
+
+
 def validate_ai_source_integrity(row):
     """
     AI 원문 안전성 검증.
@@ -2940,7 +3188,7 @@ def validate_ai_source_integrity(row):
             row.get("amount", 0)
         )
 
-        source_amount = normalize_amount_digits(
+        source_candidates = extract_amount_candidates(
             source_amount_text
         )
 
@@ -2949,12 +3197,16 @@ def validate_ai_source_integrity(row):
                 "최종 결제금액을 확인할 수 없습니다."
             )
 
-        elif source_amount is None:
+        elif not source_candidates:
             critical_issues.append(
                 "영수증 원문에서 결제금액을 직접 확인하지 못했습니다."
             )
 
-        elif amount != source_amount:
+        elif not source_amount_matches_expected(
+            source_amount_text,
+            amount,
+            "KRW",
+        ):
             critical_issues.append(
                 "AI 입력 금액과 영수증 원문 금액이 일치하지 않습니다."
             )
@@ -2965,7 +3217,7 @@ def validate_ai_source_integrity(row):
             row.get("original_amount")
         )
 
-        source_original = parse_decimal_amount(
+        source_candidates = extract_amount_candidates(
             source_amount_text
         )
 
@@ -2974,12 +3226,16 @@ def validate_ai_source_integrity(row):
                 "외화 최종 결제금액을 확인할 수 없습니다."
             )
 
-        elif source_original is None:
+        elif not source_candidates:
             critical_issues.append(
                 "영수증 원문에서 외화 결제금액을 직접 확인하지 못했습니다."
             )
 
-        elif abs(original_amount - source_original) > Decimal("0.01"):
+        elif not source_amount_matches_expected(
+            source_amount_text,
+            original_amount,
+            currency,
+        ):
             critical_issues.append(
                 "AI가 읽은 외화 금액과 영수증 원문 금액이 일치하지 않습니다."
             )
@@ -3227,12 +3483,34 @@ def add_duplicate_flags(df):
 
     for source_file, payload in st.session_state.uploaded_images.items():
         try:
-            raw = payload.get("bytes")
-        except Exception:
-            raw = None
+            source_hash = str(
+                payload.get(
+                    "source_hash",
+                    "",
+                )
+                or ""
+            )
 
-        if raw:
-            source_hash_map[source_file] = get_file_hash(raw)
+            if not source_hash:
+                raw = payload.get(
+                    "bytes"
+                )
+
+                if raw:
+                    source_hash = get_file_hash(
+                        raw
+                    )
+                    payload[
+                        "source_hash"
+                    ] = source_hash
+
+            if source_hash:
+                source_hash_map[
+                    source_file
+                ] = source_hash
+
+        except Exception:
+            continue
 
     result["_source_hash"] = result["source_file"].map(
         lambda x: source_hash_map.get(str(x), "")
@@ -3528,6 +3806,12 @@ def set_flash(
 def confirm_receipt(
     receipt_id
 ):
+    """
+    사용자가 한 영수증을 직접 확인한 경우 해당 행만 갱신한다.
+
+    이전처럼 전체 DataFrame에 대해
+    AI 안전검사 / 중복검사 / 증빙상태를 다시 계산하지 않는다.
+    """
 
     df = (
         st.session_state
@@ -3545,6 +3829,31 @@ def confirm_receipt(
 
     if not mask.any():
         return False
+
+    if "force_full_image_export" not in df.columns:
+        df[
+            "force_full_image_export"
+        ] = False
+
+    if "duplicate_suspect" not in df.columns:
+        df[
+            "duplicate_suspect"
+        ] = False
+
+    if "ai_source_safe" not in df.columns:
+        df[
+            "ai_source_safe"
+        ] = False
+
+    if "ai_safety_issue" not in df.columns:
+        df[
+            "ai_safety_issue"
+        ] = ""
+
+    if "evidence_final_ok" not in df.columns:
+        df[
+            "evidence_final_ok"
+        ] = False
 
     df.loc[
         mask,
@@ -3561,26 +3870,33 @@ def confirm_receipt(
         "manual_override",
     ] = True
 
-    # 사용자가 검증 화면의 실제 영수증 이미지를 보고
-    # "직접 확인 후 확정"을 누른 경우, 내용과 증빙을 동시에 승인한다.
-    # 따라서 별도의 "증빙 정상 승인" 버튼을 다시 누를 필요가 없다.
     df.loc[
         mask,
         "evidence_manual_approved",
     ] = True
 
-    # 중요:
-    # 사용자가 직접 확인하더라도 복수 영수증 원본 전체를
-    # PDF/JPG 증빙으로 내보내지 않는다.
-    #
-    # 사진 한 장에 영수증 여러 장이 있으면 최종 출력은
-    # 반드시 해당 영수증의 safe_bbox crop 한 장만 사용한다.
-    if "force_full_image_export" not in df.columns:
+    df.loc[
+        mask,
+        "evidence_final_ok",
+    ] = True
 
-        df[
-            "force_full_image_export"
-        ] = False
+    df.loc[
+        mask,
+        "ai_source_safe",
+    ] = True
 
+    df.loc[
+        mask,
+        "ai_safety_issue",
+    ] = ""
+
+    # 사용자가 직접 승인한 행은 중복 오탐으로 다시 막지 않는다.
+    df.loc[
+        mask,
+        "duplicate_suspect",
+    ] = False
+
+    # 복수 영수증이라도 원본 전체 export로 바꾸지 않는다.
     df.loc[
         mask,
         "force_full_image_export",
@@ -3596,21 +3912,12 @@ def confirm_receipt(
         "review_question",
     ] = ""
 
-    df = add_ai_safety_status(
-        df
-    )
-
-    df = add_duplicate_flags(
-        df
-    )
-
-    df = add_final_evidence_status(
-        df
-    )
-
     st.session_state.receipt_df = df
 
-    invalidate_generated_files()
+    # 이미지 자체는 바뀌지 않았으므로 export 이미지 cache는 보존.
+    invalidate_generated_files(
+        preserve_export_images=True
+    )
 
     set_flash(
         "영수증 내용과 증빙 이미지를 직접 확인하여 최종 확정했습니다."
@@ -3618,10 +3925,12 @@ def confirm_receipt(
 
     return True
 
-
 def approve_evidence(
     receipt_id
 ):
+    """
+    증빙 승인 역시 해당 행만 갱신한다.
+    """
 
     df = (
         st.session_state
@@ -3640,18 +3949,26 @@ def approve_evidence(
     if not mask.any():
         return False
 
+    if "evidence_final_ok" not in df.columns:
+        df[
+            "evidence_final_ok"
+        ] = False
+
     df.loc[
         mask,
         "evidence_manual_approved",
     ] = True
 
-    df = add_final_evidence_status(
-        df
-    )
+    df.loc[
+        mask,
+        "evidence_final_ok",
+    ] = True
 
     st.session_state.receipt_df = df
 
-    invalidate_generated_files()
+    invalidate_generated_files(
+        preserve_export_images=True
+    )
 
     set_flash(
         "증빙 이미지를 정상 승인했습니다."
@@ -3899,7 +4216,7 @@ def get_receipt_analysis_cache_key(
             file_bytes
         )
         +
-        "_receipt_v22_usage_copy_delete"
+        "_receipt_v27_fx_fastconfirm_categorypdf"
     )
 
 
@@ -4637,23 +4954,30 @@ def load_source_image(
     source_file,
     rotation_degrees=0,
 ):
+    """
+    원본 이미지 로드.
+    session_state 키가 없는 특수 rerun에서도 AttributeError가 나지 않도록
+    dictionary 접근으로 안전하게 처리한다.
+    """
 
-    if (
+    uploaded_images = st.session_state.get(
+        "uploaded_images",
+        {},
+    )
+
+    payload = uploaded_images.get(
         source_file
-        not in
-        st.session_state.uploaded_images
-    ):
+    )
 
+    if not payload:
         return None
 
-    raw = (
-        st.session_state
-        .uploaded_images[
-            source_file
-        ][
-            "bytes"
-        ]
+    raw = payload.get(
+        "bytes"
     )
+
+    if not raw:
+        return None
 
     try:
 
@@ -5016,15 +5340,15 @@ def can_auto_approve_evidence(
     """
     증빙 자동 승인 판단.
 
-    절대 조건:
-    - 사진 1장에 영수증 1장(full_image)은 기존 고신뢰도 자동승인 가능.
-    - 사진 1장에 여러 영수증이 있는 safe_bbox crop은
-      신뢰도가 99%여도 자동승인하지 않는다.
-      반드시 2차 증빙 검증에서 '최종 청구금액이 실제로 보이는지' 확인한다.
+    단일 영수증(full_image):
+    - 신뢰도 90% 이상
+    - 날짜/금액/원문 안전성 정상
+    - 원본 전체 이미지 사용
+    이면 2차 AI 호출 없이 자동 승인한다.
 
-    이유:
-    데이터 인식 신뢰도가 높아도 crop 좌표가 짧게 잡히면
-    PDF/JPG 증빙에서 최종금액이 사라질 수 있기 때문이다.
+    복수 영수증(safe_bbox):
+    - 신뢰도가 높아도 반드시 2차 증빙 검증을 거친다.
+    - 최종금액이 crop 안에 실제로 보이는지 확인하는 기존 안전조건 유지.
     """
 
     confidence = safe_float(
@@ -5059,25 +5383,13 @@ def can_auto_approve_evidence(
         0
     )
 
-    merchant_ok = bool(
-        str(
-            row.get(
-                "merchant",
-                "",
-            )
-            or
-            ""
-        ).strip()
-    )
-
     date_ok = bool(
         str(
             row.get(
                 "date",
                 "",
             )
-            or
-            ""
+            or ""
         ).strip()
     )
 
@@ -5096,70 +5408,25 @@ def can_auto_approve_evidence(
         )
     )
 
-    # 복수 영수증 crop은 무조건 AI 증빙 재검증으로 보낸다.
     if (
-        source_receipt_count
-        >
-        1
+        source_receipt_count > 1
         or
-        crop_mode
-        ==
-        "safe_bbox"
+        crop_mode == "safe_bbox"
     ):
-
         return False
 
-    # 단일 영수증 full_image만 고신뢰도 우회 허용.
-    if (
-        crop_mode
-        ==
-        "full_image"
+    return (
+        crop_mode == "full_image"
         and
-        confidence
-        >=
-        HIGH_CONFIDENCE_EVIDENCE_AUTO_APPROVE
+        confidence >= HIGH_CONFIDENCE_SOFT_SOURCE_AUTO_APPROVE
         and
         source_safe
         and
         crop_ok
         and
         amount_ok
-        and
-        merchant_ok
         and
         date_ok
-    ):
-
-        return True
-
-    return (
-        crop_mode
-        ==
-        "full_image"
-        and
-        confidence
-        >=
-        0.93
-        and
-        source_safe
-        and
-        safe_bool(
-            row.get(
-                "complete_visible",
-                False,
-            )
-        )
-        and
-        not safe_bool(
-            row.get(
-                "needs_review",
-                False,
-            )
-        )
-        and
-        crop_ok
-        and
-        amount_ok
     )
 
 
@@ -5168,11 +5435,22 @@ def can_auto_approve_evidence(
 # =========================================================
 
 def validate_receipt_crop(
-    row
+    row,
+    prepared_crop=None,
 ):
+    """
+    2차 증빙 검증 worker 함수.
 
-    crop = crop_receipt(
-        row
+    병렬 worker에서 Streamlit session_state를 읽지 않도록
+    메인 스레드에서 만들어 둔 prepared_crop을 우선 사용한다.
+    """
+
+    crop = (
+        prepared_crop.copy()
+        if prepared_crop is not None
+        else crop_receipt(
+            row
+        )
     )
 
     if crop is None:
@@ -5193,11 +5471,11 @@ def validate_receipt_crop(
     if (
         max_side
         >
-        1200
+        EVIDENCE_VALIDATION_MAX_SIDE
     ):
 
         scale = (
-            1200
+            EVIDENCE_VALIDATION_MAX_SIDE
             /
             max_side
         )
@@ -5221,7 +5499,7 @@ def validate_receipt_crop(
                     ),
                 ),
             ),
-            Image.Resampling.BILINEAR,
+            Image.Resampling.LANCZOS,
         )
 
     expected_source_amount = str(
@@ -5316,7 +5594,13 @@ JSON 객체만 출력:
 
     try:
 
-        response = client.responses.create(
+        validation_client = OpenAI(
+            api_key=API_KEY,
+            timeout=35.0,
+            max_retries=1,
+        )
+
+        response = validation_client.responses.create(
             model="gpt-5.6-luna",
             store=False,
             input=[
@@ -5468,25 +5752,11 @@ def run_evidence_validation_fast(
 
     result = df.copy()
 
-    result[
-        "evidence_ok"
-    ] = False
-
-    result[
-        "evidence_confidence"
-    ] = 0.0
-
-    result[
-        "evidence_issue"
-    ] = ""
-
-    result[
-        "evidence_manual_approved"
-    ] = False
-
-    result[
-        "evidence_check_method"
-    ] = ""
+    result["evidence_ok"] = False
+    result["evidence_confidence"] = 0.0
+    result["evidence_issue"] = ""
+    result["evidence_manual_approved"] = False
+    result["evidence_check_method"] = ""
 
     auto_count = 0
     review_indices = []
@@ -5537,20 +5807,17 @@ def run_evidence_validation_fast(
             review_indices
         )
 
-        for n, idx in enumerate(
-            review_indices
-        ):
+        completed = 0
+        prepared_crops = {}
+        api_indices = []
+
+        # crop 생성은 메인 스레드에서만 수행한다.
+        # worker thread가 Streamlit session_state를 읽지 않게 하기 위함.
+        for idx in review_indices:
 
             row = result.loc[
                 idx
-            ]
-
-            status.info(
-                (
-                    "추가 확인이 필요한 영수증만 재검증 중 · "
-                    f"{n + 1}/{total}"
-                )
-            )
+            ].copy()
 
             if not safe_bool(
                 row.get(
@@ -5576,47 +5843,147 @@ def run_evidence_validation_fast(
                     "evidence_check_method",
                 ] = "수동 확인"
 
-            else:
+                completed += 1
 
-                check = (
-                    validate_receipt_crop(
-                        row
-                    )
+                progress.progress(
+                    completed
+                    /
+                    total
                 )
 
-                result.at[
-                    idx,
-                    "evidence_ok",
-                ] = check[
-                    "evidence_ok"
-                ]
+                continue
 
-                result.at[
-                    idx,
-                    "evidence_confidence",
-                ] = check[
-                    "evidence_confidence"
-                ]
+            prepared_crop = crop_receipt(
+                row
+            )
+
+            if prepared_crop is None:
 
                 result.at[
                     idx,
                     "evidence_issue",
-                ] = check[
-                    "evidence_issue"
-                ]
+                ] = "영수증 이미지를 만들 수 없습니다."
 
                 result.at[
                     idx,
                     "evidence_check_method",
-                ] = "AI 재검증"
+                ] = "수동 확인"
 
-            progress.progress(
-                (
-                    n + 1
+                completed += 1
+
+                progress.progress(
+                    completed
+                    /
+                    total
                 )
-                /
-                total
+
+                continue
+
+            prepared_crops[
+                idx
+            ] = prepared_crop
+
+            api_indices.append(
+                idx
             )
+
+        if api_indices:
+
+            max_workers = min(
+                EVIDENCE_VALIDATION_MAX_WORKERS,
+                len(
+                    api_indices
+                ),
+            )
+
+            status.info(
+                (
+                    "추가 확인이 필요한 영수증 병렬 재검증 중 · "
+                    f"0/{len(api_indices)} "
+                    f"(최대 {max_workers}장 동시)"
+                )
+            )
+
+            with ThreadPoolExecutor(
+                max_workers=max_workers
+            ) as executor:
+
+                future_map = {
+                    executor.submit(
+                        validate_receipt_crop,
+                        result.loc[
+                            idx
+                        ].copy(),
+                        prepared_crops[
+                            idx
+                        ],
+                    ):
+                    idx
+                    for idx in api_indices
+                }
+
+                finished_api = 0
+
+                for future in as_completed(
+                    future_map
+                ):
+
+                    idx = future_map[
+                        future
+                    ]
+
+                    try:
+                        check = future.result()
+
+                    except Exception:
+                        check = {
+                            "evidence_ok": False,
+                            "evidence_confidence": 0.0,
+                            "evidence_issue": "자동 재검증을 완료하지 못했습니다.",
+                        }
+
+                    result.at[
+                        idx,
+                        "evidence_ok",
+                    ] = check[
+                        "evidence_ok"
+                    ]
+
+                    result.at[
+                        idx,
+                        "evidence_confidence",
+                    ] = check[
+                        "evidence_confidence"
+                    ]
+
+                    result.at[
+                        idx,
+                        "evidence_issue",
+                    ] = check[
+                        "evidence_issue"
+                    ]
+
+                    result.at[
+                        idx,
+                        "evidence_check_method",
+                    ] = "AI 재검증"
+
+                    finished_api += 1
+                    completed += 1
+
+                    status.info(
+                        (
+                            "추가 확인이 필요한 영수증 병렬 재검증 중 · "
+                            f"{finished_api}/{len(api_indices)} "
+                            f"(최대 {max_workers}장 동시)"
+                        )
+                    )
+
+                    progress.progress(
+                        completed
+                        /
+                        total
+                    )
 
         status.empty()
         progress.empty()
@@ -5892,7 +6259,29 @@ def build_export_image_cache(
             st.session_state.export_image_cache,
         )
 
-    cache = {}
+    existing_cache = dict(
+        st.session_state.get(
+            "export_image_cache",
+            {},
+        )
+        or {}
+    )
+
+    final_receipt_ids = {
+        str(
+            value
+        )
+        for value in final_df[
+            "receipt_id"
+        ].tolist()
+    }
+
+    # 최종대상에 남아 있는 기존 이미지만 재사용.
+    cache = {
+        receipt_id: image
+        for receipt_id, image in existing_cache.items()
+        if receipt_id in final_receipt_ids
+    }
 
     total = len(
         final_df
@@ -5931,9 +6320,17 @@ def build_export_image_cache(
             )
         )
 
-        image = get_export_receipt_image(
-            row
-        )
+        if receipt_id in cache:
+
+            image = cache[
+                receipt_id
+            ]
+
+        else:
+
+            image = get_export_receipt_image(
+                row
+            )
 
         if image is not None:
 
@@ -6298,52 +6695,29 @@ def create_pdf(
     final_df,
     image_cache,
 ):
+    """
+    정산 PDF 생성.
 
-    final_df = sort_receipts_chronologically(
+    기존 출력 규격은 그대로 유지:
+    - A4 가로
+    - 4열 x 2행
+    - 페이지당 최대 8개
+    - 종횡비 유지
+    - crop / 강제 늘이기 / 찌그러뜨리기 없음
+    - 300dpi
+
+    추가 규칙:
+    - 서로 다른 계정과목을 같은 페이지에 섞지 않는다.
+    - 한 계정과목의 영수증을 날짜/시간순으로 모두 배치한 뒤
+      다음 계정과목은 반드시 새 페이지에서 시작한다.
+    """
+
+    work_df = sort_receipts_chronologically(
         final_df
     )
 
-    receipts = []
-
-    for _, row in final_df.iterrows():
-
-        receipt_id = str(
-            row[
-                "receipt_id"
-            ]
-        )
-
-        image = image_cache.get(
-            receipt_id
-        )
-
-        if image is None:
-            continue
-
-        receipts.append(
-            (
-                row,
-                image,
-            )
-        )
-
-    if not receipts:
+    if work_df.empty:
         return None
-
-
-    # -----------------------------------------------------
-    # PDF LAYOUT
-    # -----------------------------------------------------
-    # A4 가로 / 4열 x 2행 / 최대 8개
-    #
-    # 핵심:
-    # - 모든 영수증이 동일한 크기의 고정 슬롯(card)에 들어감
-    # - 원본 종횡비 유지
-    # - crop / 강제 늘이기 / 찌그러뜨리기 없음
-    # - 큰 영수증은 슬롯 안에 들어오도록 축소
-    # - 작은 영수증도 동일 슬롯 안에 중앙 배치
-    # - 캡션, 이미지 슬롯의 상단/하단/열 폭 모두 동일
-    # -----------------------------------------------------
 
     page_width = 3508
     page_height = 2480
@@ -6358,18 +6732,18 @@ def create_pdf(
     gap_x = 28
     gap_y = 40
 
-    # 기존 상단 날짜/금액 캡션 제거
     caption_height = 0
     caption_gap = 0
 
-    # 각 영수증이 들어갈 고정 셀
     cell_width = int(
         (
             page_width
             -
             margin_x * 2
             -
-            gap_x * (columns - 1)
+            gap_x * (
+                columns - 1
+            )
         )
         /
         columns
@@ -6381,13 +6755,14 @@ def create_pdf(
             -
             margin_y * 2
             -
-            gap_y * (rows - 1)
+            gap_y * (
+                rows - 1
+            )
         )
         /
         rows
     )
 
-    # 영수증 이미지 자체가 들어가는 고정 슬롯
     slot_padding_x = 20
     slot_padding_y = 20
 
@@ -6409,235 +6784,307 @@ def create_pdf(
 
     pages = []
 
-
-    for page_start in range(
-        0,
-        len(receipts),
-        per_page,
-    ):
-
-        page = Image.new(
-            "RGB",
-            (
-                page_width,
-                page_height,
-            ),
-            "white",
+    # 기존 계정과목 순서를 우선 사용하고,
+    # 예외적인 과거 데이터 카테고리는 마지막에 추가한다.
+    present_categories = [
+        str(
+            value
         )
-
-        draw = ImageDraw.Draw(
-            page
-        )
-
-        current_receipts = receipts[
-            page_start:
-            page_start + per_page
+        for value in work_df[
+            "category"
         ]
+        .fillna(
+            "기타"
+        )
+        .astype(str)
+        .unique()
+        .tolist()
+    ]
 
+    category_order = [
+        category
+        for category in CATEGORIES
+        if category in present_categories
+    ]
 
-        for slot_index, (
-            row,
-            source_image,
-        ) in enumerate(
-            current_receipts
+    category_order.extend(
+        category
+        for category in present_categories
+        if category not in category_order
+    )
+
+    for category in category_order:
+
+        category_df = work_df[
+            work_df[
+                "category"
+            ]
+            .fillna(
+                "기타"
+            )
+            .astype(str)
+            ==
+            category
+        ].copy()
+
+        category_df = sort_receipts_chronologically(
+            category_df
+        )
+
+        receipts = []
+
+        for _, row in category_df.iterrows():
+
+            receipt_id = str(
+                row[
+                    "receipt_id"
+                ]
+            )
+
+            image = image_cache.get(
+                receipt_id
+            )
+
+            if image is None:
+                continue
+
+            receipts.append(
+                (
+                    row,
+                    image,
+                )
+            )
+
+        if not receipts:
+            continue
+
+        # 중요:
+        # category loop 안에서 page_start를 다시 0부터 시작하므로
+        # 계정과목이 바뀌면 무조건 새 페이지가 시작된다.
+        for page_start in range(
+            0,
+            len(
+                receipts
+            ),
+            per_page,
         ):
 
-            row_index = (
-                slot_index
-                //
-                columns
-            )
-
-            column_index = (
-                slot_index
-                %
-                columns
-            )
-
-            cell_x = (
-                margin_x
-                +
-                column_index
-                *
-                (
-                    cell_width
-                    +
-                    gap_x
-                )
-            )
-
-            cell_y = (
-                margin_y
-                +
-                row_index
-                *
-                (
-                    cell_height
-                    +
-                    gap_y
-                )
-            )
-
-
-            # ---------------------------------------------
-            # 고정 이미지 슬롯 생성
-            # ---------------------------------------------
-            # 슬롯 자체 크기는 모든 영수증에서 완전히 동일하다.
-            # 영수증 원본은 비율을 유지한 채 슬롯 안에 contain한다.
-            # ---------------------------------------------
-
-            tile = Image.new(
+            page = Image.new(
                 "RGB",
                 (
-                    slot_width,
-                    slot_height,
+                    page_width,
+                    page_height,
                 ),
                 "white",
             )
 
-            resized, target_width, target_height = (
-                resize_for_document_export(
-                    source_image,
-                    slot_width,
-                    slot_height,
-                )
+            draw = ImageDraw.Draw(
+                page
             )
 
-
-            # 영수증을 동일 고정 슬롯 중앙에 배치
-            receipt_x = max(
-                0,
-                (
-                    slot_width
-                    -
-                    target_width
-                )
-                //
-                2,
-            )
-
-            receipt_y = max(
-                0,
-                (
-                    slot_height
-                    -
-                    target_height
-                )
-                //
-                2,
-            )
-
-            tile.paste(
-                resized,
-                (
-                    receipt_x,
-                    receipt_y,
-                ),
-            )
-
-
-            # ---------------------------------------------
-            # 고정 슬롯을 페이지의 동일 위치에 붙여넣음
-            # ---------------------------------------------
-
-            slot_x = (
-                cell_x
+            current_receipts = receipts[
+                page_start:
+                page_start
                 +
-                slot_padding_x
-            )
+                per_page
+            ]
 
-            slot_y = (
-                cell_y
-                +
-                slot_padding_y
-            )
+            for slot_index, (
+                row,
+                source_image,
+            ) in enumerate(
+                current_receipts
+            ):
 
-            page.paste(
-                tile,
-                (
-                    slot_x,
-                    slot_y,
-                ),
-            )
+                row_index = (
+                    slot_index
+                    //
+                    columns
+                )
 
+                column_index = (
+                    slot_index
+                    %
+                    columns
+                )
 
-            # ---------------------------------------------
-            # 아주 연한 슬롯 테두리
-            # 영수증 크기가 달라도 각 칸의 기준선이 눈에 보이도록 함
-            # ---------------------------------------------
+                cell_x = (
+                    margin_x
+                    +
+                    column_index
+                    *
+                    (
+                        cell_width
+                        +
+                        gap_x
+                    )
+                )
 
-            draw.rectangle(
-                (
-                    slot_x,
-                    slot_y,
-                    slot_x + slot_width - 1,
-                    slot_y + slot_height - 1,
-                ),
-                outline="#F2F2F2",
-                width=2,
-            )
+                cell_y = (
+                    margin_y
+                    +
+                    row_index
+                    *
+                    (
+                        cell_height
+                        +
+                        gap_y
+                    )
+                )
 
+                tile = Image.new(
+                    "RGB",
+                    (
+                        slot_width,
+                        slot_height,
+                    ),
+                    "white",
+                )
 
-            # 열 구분선
-            if column_index < columns - 1:
+                resized, target_width, target_height = (
+                    resize_for_document_export(
+                        source_image,
+                        slot_width,
+                        slot_height,
+                    )
+                )
 
-                separator_x = (
+                receipt_x = max(
+                    0,
+                    (
+                        slot_width
+                        -
+                        target_width
+                    )
+                    //
+                    2,
+                )
+
+                receipt_y = max(
+                    0,
+                    (
+                        slot_height
+                        -
+                        target_height
+                    )
+                    //
+                    2,
+                )
+
+                tile.paste(
+                    resized,
+                    (
+                        receipt_x,
+                        receipt_y,
+                    ),
+                )
+
+                slot_x = (
                     cell_x
                     +
-                    cell_width
-                    +
-                    gap_x
-                    //
-                    2
+                    slot_padding_x
                 )
 
-                draw.line(
+                slot_y = (
+                    cell_y
+                    +
+                    slot_padding_y
+                )
+
+                page.paste(
+                    tile,
                     (
-                        separator_x,
-                        cell_y,
-                        separator_x,
-                        cell_y + cell_height,
+                        slot_x,
+                        slot_y,
                     ),
-                    fill="#F3F3F3",
+                )
+
+                draw.rectangle(
+                    (
+                        slot_x,
+                        slot_y,
+                        slot_x
+                        +
+                        slot_width
+                        -
+                        1,
+                        slot_y
+                        +
+                        slot_height
+                        -
+                        1,
+                    ),
+                    outline="#F2F2F2",
                     width=2,
                 )
 
+                if column_index < columns - 1:
 
-        # 행 구분선
-        separator_y = (
-            margin_y
-            +
-            cell_height
-            +
-            gap_y
-            //
-            2
-        )
+                    separator_x = (
+                        cell_x
+                        +
+                        cell_width
+                        +
+                        gap_x
+                        //
+                        2
+                    )
 
-        draw.line(
-            (
-                margin_x,
-                separator_y,
-                page_width - margin_x,
-                separator_y,
-            ),
-            fill="#ECECEC",
-            width=2,
-        )
+                    draw.line(
+                        (
+                            separator_x,
+                            cell_y,
+                            separator_x,
+                            cell_y
+                            +
+                            cell_height,
+                        ),
+                        fill="#F3F3F3",
+                        width=2,
+                    )
 
-        pages.append(
-            page
-        )
+            separator_y = (
+                margin_y
+                +
+                cell_height
+                +
+                gap_y
+                //
+                2
+            )
 
+            draw.line(
+                (
+                    margin_x,
+                    separator_y,
+                    page_width
+                    -
+                    margin_x,
+                    separator_y,
+                ),
+                fill="#ECECEC",
+                width=2,
+            )
+
+            pages.append(
+                page
+            )
+
+    if not pages:
+        return None
 
     output = io.BytesIO()
 
-    pages[0].save(
+    pages[
+        0
+    ].save(
         output,
         format="PDF",
         save_all=True,
         append_images=(
-            pages[1:]
+            pages[
+                1:
+            ]
         ),
         resolution=300.0,
     )
@@ -6890,14 +7337,14 @@ if (
     </div>
 
     <div class="tw-hero-subtitle">
-        읽고, 분류하고, 날짜순으로 정리합니다.
+        AI로 읽고, 분류하여, 날짜순으로 정리합니다.
     </div>
 
     <div class="tw-hero-description">
         여러 장의 영수증을 순서 없이 업로드해도
         AI가 실제 영수증에 표시된 날짜 · 상호 · 결제금액을 읽어 정리합니다.<br>
         증빙 이미지는 원본 보존을 우선하며,
-        커피 · 차 · 카페 음료는 식대와 별도로 구분합니다.
+        계정과목별로 구분하여 이미지를 생성하여 바로 증빙자료로 사용하실 수 있습니다.
     </div>
 </div>
 """
@@ -6976,17 +7423,23 @@ if files:
 
     for file in prepared_files:
 
+        file_bytes = file.getvalue()
+
         uploaded_images[
             file.name
         ] = {
             "bytes":
-                file.getvalue(),
+                file_bytes,
             "mime_type":
                 file.type,
             "original_name":
                 file.original_name,
             "page_number":
                 file.page_number,
+            "source_hash":
+                get_file_hash(
+                    file_bytes
+                ),
         }
 
     st.session_state.uploaded_images = (
@@ -7857,7 +8310,9 @@ if (
                         updated
                     )
 
-                    invalidate_generated_files()
+                    invalidate_generated_files(
+                        preserve_export_images=True
+                    )
 
                     summary_text = " · ".join(
                         f"1 {currency} = {rate:,.6f}원"
