@@ -6514,12 +6514,32 @@ def create_long_jpg(
     final_df,
     image_cache,
 ):
+    """
+    전체 정산용 세로 JPG 생성.
+
+    Streamlit Cloud / Pillow 안전성 보강:
+    - 영수증을 기존처럼 세로로 이어 붙인다.
+    - 기본 목표 폭 1800px 유지.
+    - 다만 전체 세로 길이가 JPEG 인코더 안전 범위를 넘거나
+      캔버스 픽셀 수가 지나치게 커지는 경우 전체 영수증 이미지를
+      동일 비율로 자동 축소한다.
+    - 원본 증빙은 수정하지 않고 JPG 출력 사본만 축소한다.
+    - PDF / Excel 생성에는 영향을 주지 않는다.
+    """
 
     final_df = sort_receipts_chronologically(
         final_df
     )
 
     target_width = 1800
+
+    # JPEG 구현체는 지나치게 긴 단일 이미지를 저장할 때
+    # encoder error가 발생할 수 있으므로 여유를 둔 안전 한계를 사용한다.
+    JPEG_SAFE_MAX_DIMENSION = 60000
+
+    # Streamlit Cloud에서 한 번에 만드는 RGB canvas 메모리를 제한한다.
+    # 55M pixels ~= raw RGB 약 165MB 수준.
+    JPEG_SAFE_MAX_PIXELS = 55_000_000
 
     receipts = []
 
@@ -6538,9 +6558,11 @@ def create_long_jpg(
         if source is None:
             continue
 
-        image = source.copy()
+        image = source.copy().convert(
+            "RGB"
+        )
 
-        # 확대는 하지 않음
+        # 기존 동작 유지: 폭이 1800px보다 큰 경우에만 우선 축소.
         if (
             image.width
             >
@@ -6559,9 +6581,11 @@ def create_long_jpg(
                     max(
                         1,
                         int(
-                            image.height
-                            *
-                            ratio
+                            round(
+                                image.height
+                                *
+                                ratio
+                            )
                         ),
                     ),
                 ),
@@ -6580,6 +6604,11 @@ def create_long_jpg(
 
     header_height = 40
     gap = 18
+    outer_margin = 20
+
+    # -----------------------------------------------------
+    # 1차 예상 canvas 크기
+    # -----------------------------------------------------
 
     max_width = max(
         image.width
@@ -6587,7 +6616,7 @@ def create_long_jpg(
     )
 
     total_height = (
-        20
+        outer_margin
         +
         sum(
             header_height
@@ -6599,12 +6628,252 @@ def create_long_jpg(
         )
     )
 
+    canvas_width = (
+        max_width
+        +
+        outer_margin * 2
+    )
+
+    # -----------------------------------------------------
+    # JPEG 안전크기를 초과하면 출력 사본만 동일비율 축소.
+    #
+    # 헤더/간격은 고정 픽셀이므로 이미지 영역 기준으로
+    # 필요한 비율을 계산한다.
+    # -----------------------------------------------------
+
+    fixed_vertical = (
+        outer_margin
+        +
+        len(receipts)
+        *
+        (
+            header_height
+            +
+            gap
+        )
+    )
+
+    image_height_sum = sum(
+        image.height
+        for _, image in receipts
+    )
+
+    scale_by_height = 1.0
+
+    if total_height > JPEG_SAFE_MAX_DIMENSION:
+
+        available_image_height = max(
+            1,
+            JPEG_SAFE_MAX_DIMENSION
+            -
+            fixed_vertical
+            -
+            200,
+        )
+
+        scale_by_height = min(
+            1.0,
+            available_image_height
+            /
+            max(
+                1,
+                image_height_sum,
+            ),
+        )
+
+    current_pixels = (
+        canvas_width
+        *
+        total_height
+    )
+
+    scale_by_pixels = 1.0
+
+    if current_pixels > JPEG_SAFE_MAX_PIXELS:
+
+        # 폭/높이가 모두 같은 비율로 줄어드므로 면적은 scale^2.
+        scale_by_pixels = min(
+            1.0,
+            (
+                JPEG_SAFE_MAX_PIXELS
+                /
+                max(
+                    1,
+                    current_pixels,
+                )
+            )
+            ** 0.5,
+        )
+
+    global_scale = min(
+        1.0,
+        scale_by_height,
+        scale_by_pixels,
+    )
+
+    if global_scale < 0.999:
+
+        scaled_receipts = []
+
+        for row, image in receipts:
+
+            new_width = max(
+                1,
+                int(
+                    round(
+                        image.width
+                        *
+                        global_scale
+                    )
+                ),
+            )
+
+            new_height = max(
+                1,
+                int(
+                    round(
+                        image.height
+                        *
+                        global_scale
+                    )
+                ),
+            )
+
+            image = image.resize(
+                (
+                    new_width,
+                    new_height,
+                ),
+                Image.Resampling.LANCZOS,
+            )
+
+            scaled_receipts.append(
+                (
+                    row,
+                    image,
+                )
+            )
+
+        receipts = scaled_receipts
+
+    # -----------------------------------------------------
+    # 최종 canvas 크기 재계산
+    # -----------------------------------------------------
+
+    max_width = max(
+        image.width
+        for _, image in receipts
+    )
+
+    total_height = (
+        outer_margin
+        +
+        sum(
+            header_height
+            +
+            image.height
+            +
+            gap
+            for _, image in receipts
+        )
+    )
+
+    canvas_width = (
+        max_width
+        +
+        outer_margin * 2
+    )
+
+    # 드물게 헤더/간격 때문에 여전히 한계를 넘는 경우를 한 번 더 방어.
+    if total_height > JPEG_SAFE_MAX_DIMENSION:
+
+        final_scale = (
+            (
+                JPEG_SAFE_MAX_DIMENSION
+                -
+                200
+            )
+            /
+            max(
+                1,
+                total_height,
+            )
+        )
+
+        final_scale = min(
+            1.0,
+            final_scale,
+        )
+
+        if final_scale < 0.999:
+
+            scaled_receipts = []
+
+            for row, image in receipts:
+
+                image = image.resize(
+                    (
+                        max(
+                            1,
+                            int(
+                                round(
+                                    image.width
+                                    *
+                                    final_scale
+                                )
+                            ),
+                        ),
+                        max(
+                            1,
+                            int(
+                                round(
+                                    image.height
+                                    *
+                                    final_scale
+                                )
+                            ),
+                        ),
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
+
+                scaled_receipts.append(
+                    (
+                        row,
+                        image,
+                    )
+                )
+
+            receipts = scaled_receipts
+
+            max_width = max(
+                image.width
+                for _, image in receipts
+            )
+
+            total_height = (
+                outer_margin
+                +
+                sum(
+                    header_height
+                    +
+                    image.height
+                    +
+                    gap
+                    for _, image in receipts
+                )
+            )
+
+            canvas_width = (
+                max_width
+                +
+                outer_margin * 2
+            )
+
     canvas = Image.new(
         "RGB",
         (
-            max_width
-            +
-            40,
+            canvas_width,
             total_height,
         ),
         "white",
@@ -6614,13 +6883,13 @@ def create_long_jpg(
         canvas
     )
 
-    y = 20
+    y = outer_margin
 
     for row, image in receipts:
 
         draw.text(
             (
-                20,
+                outer_margin,
                 y + 8,
             ),
             (
@@ -6661,12 +6930,61 @@ def create_long_jpg(
 
     output = io.BytesIO()
 
-    canvas.save(
-        output,
-        format="JPEG",
-        quality=95,
-        optimize=False,
-    )
+    try:
+
+        canvas.save(
+            output,
+            format="JPEG",
+            quality=94,
+            optimize=False,
+            progressive=False,
+        )
+
+    except OSError:
+
+        # -------------------------------------------------
+        # Pillow/libjpeg 환경별 차이까지 고려한 최종 fallback.
+        # 첫 저장이 실패하면 canvas 자체를 85%로 줄여 한 번만 재시도.
+        # PDF/Excel과 원본 증빙에는 아무 영향이 없다.
+        # -------------------------------------------------
+
+        fallback_scale = 0.85
+
+        fallback = canvas.resize(
+            (
+                max(
+                    1,
+                    int(
+                        round(
+                            canvas.width
+                            *
+                            fallback_scale
+                        )
+                    ),
+                ),
+                max(
+                    1,
+                    int(
+                        round(
+                            canvas.height
+                            *
+                            fallback_scale
+                        )
+                    ),
+                ),
+            ),
+            Image.Resampling.LANCZOS,
+        )
+
+        output = io.BytesIO()
+
+        fallback.save(
+            output,
+            format="JPEG",
+            quality=92,
+            optimize=False,
+            progressive=False,
+        )
 
     output.seek(
         0
